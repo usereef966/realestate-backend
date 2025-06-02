@@ -6,7 +6,7 @@ const fetch = require('node-fetch');
 
 
 
-
+const { query } = require('./database');
 
 const app = express();
 const jwt = require('jsonwebtoken');
@@ -15,21 +15,8 @@ app.use(express.json());
 app.use(cors());
 
 
-const db = mysql.createConnection({
-  host:     process.env.MYSQLHOST,
-  port:     process.env.MYSQLPORT,
-  user:     process.env.MYSQLUSER,
-  password: process.env.MYSQLPASSWORD,
-  database: process.env.MYSQLDATABASE,
-});
+// اتصال Pool يدير الاتصال تلقائيًا
 
-db.connect((err) => {
-  if (err) {
-    console.error('DB Connection Failed:', err);
-  } else {
-    console.log('DB Connected Successfully!');
-  }
-});
 
 
 // تجهيز multer لحفظ الملفات
@@ -63,55 +50,59 @@ function verifyToken(req, res, next) {
 
 
 // Login Endpoint (بدون حماية)
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const { userId, token } = req.body;
 
-  const query = 'SELECT id, user_id, name, user_type FROM users WHERE user_id = ? AND token = ?';
+  try {
+    const results = await query(
+      'SELECT id, user_id, name, user_type FROM users WHERE user_id = ? AND token = ?',
+      [userId, token]
+    );
 
-  db.query(query, [userId, token], (err, results) => {
-    if (err || results.length === 0) {
+    if (results.length === 0) {
       return res.status(401).json({ message: 'بيانات الدخول غير صحيحة' });
     }
 
     const user = results[0];
 
-    // تحقق من نوع المستخدم
     if (user.user_type === 'admin') {
-      // تحقق من اشتراك المالك
-      const adminSubQuery = `
-        SELECT 1 FROM admin_subscriptions 
-        WHERE admin_id = ? AND end_date >= CURDATE()
-        LIMIT 1
-      `;
-      db.query(adminSubQuery, [user.id], (err, subResults) => {
-        if (err || subResults.length === 0) {
-          return res.status(403).json({ message: 'انتهى اشتراك المالك أو غير موجود' });
-        }
-        // اشتراك فعّال، أكمل تسجيل الدخول
-        return sendLoginSuccess(res, user);
-      });
-    } else if (user.user_type === 'user') {
-      // تحقق من عقد المستأجر
-      const userContractQuery = `
-        SELECT 1 FROM rental_contracts 
-        WHERE tenant_id = ? AND contract_end >= CURDATE()
-        LIMIT 1
-      `;
-      db.query(userContractQuery, [user.id], (err, contractResults) => {
-        if (err || contractResults.length === 0) {
-          return res.status(403).json({ message: 'انتهى عقد المستأجر أو غير موجود' });
-        }
-        // عقد فعّال، أكمل تسجيل الدخول
-        return sendLoginSuccess(res, user);
-      });
-    } else if (user.user_type === 'super') {
-      // سوبر أدمن، لا تحقق من اشتراك
+      const subResults = await query(
+        `SELECT 1 FROM admin_subscriptions WHERE admin_id = ? AND end_date >= CURDATE() LIMIT 1`,
+        [user.id]
+      );
+
+      if (subResults.length === 0) {
+        return res.status(403).json({ message: 'انتهى اشتراك المالك أو غير موجود' });
+      }
+
       return sendLoginSuccess(res, user);
-    } else {
-      return res.status(403).json({ message: 'نوع مستخدم غير مدعوم' });
     }
-  });
+
+    if (user.user_type === 'user') {
+      const contractResults = await query(
+        `SELECT 1 FROM rental_contracts WHERE tenant_id = ? AND contract_end >= CURDATE() LIMIT 1`,
+        [user.id]
+      );
+
+      if (contractResults.length === 0) {
+        return res.status(403).json({ message: 'انتهى عقد المستأجر أو غير موجود' });
+      }
+
+      return sendLoginSuccess(res, user);
+    }
+
+    if (user.user_type === 'super') {
+      return sendLoginSuccess(res, user);
+    }
+
+    return res.status(403).json({ message: 'نوع مستخدم غير مدعوم' });
+
+  } catch (err) {
+    console.error('❌ Login Error:', err);
+    return res.status(500).json({ message: 'خطأ داخلي في الخادم' });
+  }
 });
+
 
 // دالة مساعدة لإرسال الرد الناجح وتوليد التوكن
 function sendLoginSuccess(res, user) {
@@ -147,131 +138,179 @@ function sendLoginSuccess(res, user) {
 
 
 // جميع ما يلي محمي بـ JWT
-app.post('/api/validate-admin', verifyToken, (req, res) => {
+app.post('/api/validate-admin', verifyToken, async (req, res) => {
   const { userId } = req.body;
 
-  const query = `
+  const sql = `
     SELECT u.user_id, s.end_date 
     FROM users u
     INNER JOIN admin_subscriptions s ON u.id = s.admin_id
     WHERE u.user_id = ? AND s.end_date >= CURDATE();
   `;
 
-  db.query(query, [userId], (err, results) => {
-    if (err || results.length === 0) {
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0) {
       return res.json({ valid: false });
     }
+
     res.json({ valid: true });
-  });
+
+  } catch (err) {
+    console.error('❌ Validate-admin Error:', err);
+    res.status(500).json({ valid: false });
+  }
+});
+
+app.post('/api/validate-session', verifyToken, async (req, res) => {
+  const { userId } = req.body;
+
+  const sql = `SELECT user_id FROM users WHERE user_id = ? AND user_type='super' LIMIT 1`;
+
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0) {
+      return res.json({ valid: false });
+    }
+
+    res.json({ valid: true });
+
+  } catch (err) {
+    console.error('❌ Validate-session Error:', err);
+    res.status(500).json({ valid: false });
+  }
 });
 
 
-app.post('/api/validate-session', verifyToken, (req, res) => {
+
+
+app.post('/api/validate-user', verifyToken, async (req, res) => {
   const { userId } = req.body;
 
-  const query = `SELECT user_id FROM users WHERE user_id = ? AND user_type='super' LIMIT 1`;
-
-  db.query(query, [userId], (err, results) => {
-    if (err || results.length === 0) {
-      return res.json({ valid: false });
-    }
-    res.json({ valid: true });
-  });
-});
-
-
-
-
-app.post('/api/validate-user', verifyToken, (req, res) => {
-  const { userId } = req.body;
-
-  const query = `
+  const sql = `
     SELECT u.user_id, r.contract_end
     FROM users u
     INNER JOIN rental_contracts r ON u.id = r.tenant_id
     WHERE u.user_id = ? AND r.contract_end >= CURDATE();
   `;
 
-  db.query(query, [userId], (err, results) => {
-    if (err || results.length === 0) {
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0) {
       return res.json({ valid: false });
     }
+
     res.json({ valid: true });
-  });
+
+  } catch (err) {
+    console.error('❌ Validate-user Error:', err);
+    res.status(500).json({ valid: false });
+  }
 });
 
-app.post('/api/get-admin-details', verifyToken, (req, res) => {
+
+
+
+
+
+app.post('/api/get-admin-details', verifyToken, async (req, res) => {
   const { userId } = req.body;
 
-  const query = `
+  const sql = `
     SELECT u.user_id, u.name, u.email, u.user_type
     FROM users u
     INNER JOIN admin_subscriptions s ON u.id = s.admin_id
     WHERE u.user_id = ?;
   `;
 
-  db.query(query, [userId], (err, results) => {
-    if (err || results.length === 0) {
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0) {
       return res.status(404).json({ message: 'Admin not found' });
     }
+
     res.json({ admin: results[0] });
-  });
+
+  } catch (err) {
+    console.error('❌ Get-admin-details Error:', err);
+    res.status(500).json({ message: 'خطأ داخلي في الخادم' });
+  }
 });
 
-app.post('/api/get-user-details', verifyToken, (req, res) => {
+app.post('/api/get-user-details', verifyToken, async (req, res) => {
   const { userId } = req.body;
 
-  const query = `
+  const sql = `
     SELECT u.user_id, u.name, u.email, r.contract_start, r.contract_end
     FROM users u
     INNER JOIN rental_contracts r ON u.id = r.tenant_id
     WHERE u.user_id = ?;
   `;
 
-  db.query(query, [userId], (err, results) => {
-    if (err || results.length === 0) {
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0) {
       return res.status(404).json({ message: 'User not found' });
     }
+
     res.json({ user: results[0] });
-  });
+  } catch (err) {
+    console.error('❌ Get-user-details Error:', err);
+    res.status(500).json({ message: 'خطأ داخلي في الخادم' });
+  }
 });
 
-app.post('/api/generate-admin-token', verifyToken, (req, res) => {
+
+
+
+app.post('/api/generate-admin-token', verifyToken, async (req, res) => {
   const { permissions, created_by } = req.body;
 
   const token = crypto.randomBytes(32).toString('hex');
 
-  const query = `
+  const sql = `
     INSERT INTO admin_tokens (token, permissions, created_by)
     VALUES (?, ?, ?)
   `;
 
-  db.query(query, [token, JSON.stringify(permissions), created_by], (err, result) => {
-    if (err) return res.status(500).json({ error: 'فشل في إنشاء توكن المالك' });
+  try {
+    await query(sql, [token, JSON.stringify(permissions), created_by]);
     res.json({ token, permissions });
-  });
+  } catch (err) {
+    console.error('❌ Generate-admin-token Error:', err);
+    res.status(500).json({ error: 'فشل في إنشاء توكن المالك' });
+  }
 });
 
-app.post('/api/generate-user-token', verifyToken, (req, res) => {
+
+app.post('/api/generate-user-token', verifyToken, async (req, res) => {
   const { permissions, created_by } = req.body;
 
   const token = crypto.randomBytes(32).toString('hex');
 
-  const query = `
+  const sql = `
     INSERT INTO user_tokens (token, permissions, created_by)
     VALUES (?, ?, ?)
   `;
 
-  db.query(query, [token, JSON.stringify(permissions), created_by], (err, result) => {
-    if (err) return res.status(500).json({ error: 'فشل في إنشاء توكن المستأجر' });
+  try {
+    await query(sql, [token, JSON.stringify(permissions), created_by]);
     res.json({ token, permissions });
-  });
+  } catch (err) {
+    console.error('❌ Generate-user-token Error:', err);
+    res.status(500).json({ error: 'فشل في إنشاء توكن المستأجر' });
+  }
 });
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-app.post('/api/create-admin', verifyToken, (req, res) => {
-  const { userType, id: created_by } = req.user; // تأكد هنا id رقم السوبر وليس userId
+app.post('/api/create-admin', verifyToken, async (req, res) => {
+  const { userType, id: created_by } = req.user; 
   
   if (userType !== 'super') {
     return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه إنشاء مالك.' });
@@ -285,40 +324,38 @@ app.post('/api/create-admin', verifyToken, (req, res) => {
 
   const token = crypto.randomBytes(32).toString('hex');
 
-  const insertUserQuery = `
+  const insertUserSql = `
     INSERT INTO users (user_id, name, user_type, token, created_at)
     VALUES (?, ?, 'admin', ?, NOW())
   `;
 
-  db.query(insertUserQuery, [user_id, name, token], (err, userResult) => {
-    if (err) {
-      console.error('❌ خطأ في إنشاء مالك:', err);
-      return res.status(500).json({ message: 'حدث خطأ أثناء إنشاء مالك جديد.' });
-    }
+  const insertTokenSql = `
+    INSERT INTO admin_tokens (token, permissions, created_by)
+    VALUES (?, ?, ?)
+  `;
 
-    const insertTokenQuery = `
-      INSERT INTO admin_tokens (token, permissions, created_by)
-      VALUES (?, ?, ?)
-    `;
+  try {
+    // إدخال بيانات المستخدم (admin)
+    const userResult = await query(insertUserSql, [user_id, name, token]);
 
-    // هنا created_by رقم السوبر (id) وليس userId
-    db.query(insertTokenQuery, [token, JSON.stringify(permissions), created_by], (err) => {
-      if (err) {
-        console.error('❌ خطأ في إنشاء توكن المالك:', err);
-        return res.status(500).json({ message: 'تم إنشاء المالك، ولكن فشل في إنشاء التوكن.' });
-      }
+    // إدخال التوكن والصلاحيات
+    await query(insertTokenSql, [token, JSON.stringify(permissions), created_by]);
 
-      res.json({
-        message: '✅ تم إنشاء المالك والتوكن بنجاح.',
-        adminId: userResult.insertId,
-        token
-      });
+    res.json({
+      message: '✅ تم إنشاء المالك والتوكن بنجاح.',
+      adminId: userResult.insertId,
+      token
     });
-  });
+
+  } catch (err) {
+    console.error('❌ Create-admin Error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء إنشاء المالك أو التوكن.' });
+  }
 });
 
 
-app.post('/api/create-tenant', verifyToken, (req, res) => {
+
+app.post('/api/create-tenant', verifyToken, async (req, res) => {
   const { userType, id: creatorId } = req.user;
 
   if (userType !== 'super' && userType !== 'admin') {
@@ -333,59 +370,35 @@ app.post('/api/create-tenant', verifyToken, (req, res) => {
 
   const token = crypto.randomBytes(32).toString('hex');
 
-  const insertUserQuery = `
+  const insertUserSql = `
     INSERT INTO users (user_id, name, user_type, token, created_at, created_by)
     VALUES (?, ?, 'user', ?, NOW(), ?)
   `;
 
-  db.query(insertUserQuery, [user_id, name, token, creatorId], (err, userResult) => {
-    if (err) {
-      console.error('❌ خطأ في إنشاء مستأجر:', err);
-      return res.status(500).json({ message: 'حدث خطأ أثناء إنشاء مستأجر جديد.' });
-    }
+  const insertTokenSql = `
+    INSERT INTO user_tokens (token, permissions, created_by)
+    VALUES (?, ?, ?)
+  `;
 
-    const insertTokenQuery = `
-      INSERT INTO user_tokens (token, permissions, created_by)
-      VALUES (?, ?, ?)
-    `;
+  try {
+    // إنشاء المستأجر
+    const userResult = await query(insertUserSql, [user_id, name, token, creatorId]);
 
-    db.query(insertTokenQuery, [token, JSON.stringify(permissions), creatorId], (err) => {
-      if (err) {
-        console.error('❌ خطأ في إنشاء توكن المستأجر:', err);
-        return res.status(500).json({ message: 'تم إنشاء المستأجر، ولكن فشل في إنشاء التوكن.' });
-      }
+    // إنشاء توكن المستأجر
+    await query(insertTokenSql, [token, JSON.stringify(permissions), creatorId]);
 
-      res.json({
-        message: '✅ تم إنشاء المستأجر والتوكن بنجاح.',
-        tenantId: userResult.insertId,
-        token
-      });
+    res.json({
+      message: '✅ تم إنشاء المستأجر والتوكن بنجاح.',
+      tenantId: userResult.insertId,
+      token
     });
-  });
+
+  } catch (err) {
+    console.error('❌ Create-tenant Error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء إنشاء المستأجر أو التوكن.' });
+  }
 });
-
-
-
-
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
-
-
-
-
-
-
-
-
-
 const pdfParse = require('pdf-parse');
 const fs = require('fs');
 const path = require('path');
@@ -400,30 +413,26 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-
-
-
 // ... الإعدادات السابقة كما هي
 
 app.post('/api/analyze-local-pdf', upload.single('pdf'), async (req, res) => {
   console.log("Current working directory:", process.cwd());
-console.log("File saved at:", req.file.path);
+  console.log("File saved at:", req.file.path);
+
+
   try {
     const fileBuffer = fs.readFileSync(req.file.path);
     const pdfData = await pdfParse(fileBuffer);
     const text = pdfData.text;
     
     const cleanText = (txt) =>
-  txt
-    .replace(/[^\p{L}\p{N}\s,.-]/gu, '') // يشيل الرموز الغريبة، ويحافظ عالنصوص والفواصل
-    .replace(/\s+/g, ' ')                // يصغر كل المسافات لمفردة
-    .trim();
-
-    
+      txt.replace(/[^\p{L}\p{N}\s,.-]/gu, '').replace(/\s+/g, ' ').trim();
 
     const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
     const toFloat = (v) => parseFloat(v) || 0;
     const toInt = (v) => parseInt(v) || 0;
+
+
     
 
 const data = {
@@ -550,170 +559,147 @@ admin_id: req.body.adminId,
 
    const insertQuery = `INSERT INTO rental_contracts_details SET ?`;
 
-// إدخال بيانات العقد
-db.query(insertQuery, data, (err, contractResult) => {
-  if (err) {
-    console.error('❌ DB Error:', err);
-    return res.status(500).json({ message: 'فشل في حفظ بيانات العقد' });
-  }
+    let contractResult;
+    try {
+      contractResult = await query(insertQuery, data);
+    } catch (err) {
+      console.error('❌ DB Error:', err);
+      return res.status(500).json({ message: 'فشل في حفظ بيانات العقد' });
+    }
 
-  const contractId = contractResult.insertId;
+    const contractId = contractResult.insertId;
+    const tenantId = data.tenant_id;
+    const adminId = data.admin_id;
 
-  const tenantId = data.tenant_id; // من البيانات التي أرسلتها
-  const adminId = data.admin_id; // من البيانات التي أرسلتها
+    const getUsersQuery = `
+      SELECT 
+        (SELECT user_id FROM users WHERE id = ?) AS tenantUserId,
+        (SELECT user_id FROM users WHERE id = ?) AS adminUserId
+    `;
 
-  // جلب tenant_user_id و admin_user_id بشكل صحيح (ضروري جدًا)
-  const getUsersQuery = `
-    SELECT 
-      (SELECT user_id FROM users WHERE id = ?) AS tenantUserId,
-      (SELECT user_id FROM users WHERE id = ?) AS adminUserId
-  `;
-
-  db.query(getUsersQuery, [tenantId, adminId], (userErr, userResults) => {
-    if (userErr || userResults.length === 0) {
+    let userResults;
+    try {
+      userResults = await query(getUsersQuery, [tenantId, adminId]);
+      if (userResults.length === 0) throw new Error('No users found');
+    } catch (userErr) {
       console.error('❌ خطأ في جلب بيانات المستخدمين:', userErr);
       return res.status(500).json({ message: 'خطأ في جلب بيانات المستخدمين' });
     }
 
     const { tenantUserId, adminUserId } = userResults[0];
 
-    // التحقق من وجود غرفة دردشة سابقة بين نفس المالك والمستأجر
     const checkChatRoomQuery = `
       SELECT id FROM chat_rooms WHERE tenant_user_id = ? AND admin_user_id = ? LIMIT 1
     `;
 
-    db.query(checkChatRoomQuery, [tenantUserId, adminUserId], (checkErr, checkResults) => {
-      if (checkErr) {
-        console.error('❌ خطأ في التحقق من غرفة الدردشة:', checkErr);
-        return res.status(500).json({ message: 'خطأ في التحقق من غرفة الدردشة' });
-      }
+    let checkResults;
+    try {
+      checkResults = await query(checkChatRoomQuery, [tenantUserId, adminUserId]);
+    } catch (checkErr) {
+      console.error('❌ خطأ في التحقق من غرفة الدردشة:', checkErr);
+      return res.status(500).json({ message: 'خطأ في التحقق من غرفة الدردشة' });
+    }
 
-      const createPaymentsAndSubscriptions = () => {
-        const payments = [];
-        const startDate = new Date(data.contract_start);
-        const cycleMonths = parseInt(data.rent_payment_cycle) || 1;
-        const paymentsCount = parseInt(data.rent_payments_count) || 1;
+    const createPaymentsAndSubscriptions = async () => {
+      const payments = [];
+      const startDate = new Date(data.contract_start);
+      const cycleMonths = parseInt(data.rent_payment_cycle) || 1;
+      const paymentsCount = parseInt(data.rent_payments_count) || 1;
 
-        for (let i = 1; i <= paymentsCount; i++) {
-          const dueDate = new Date(startDate);
-          dueDate.setMonth(dueDate.getMonth() + cycleMonths * (i - 1));
+      for (let i = 1; i <= paymentsCount; i++) {
+        const dueDate = new Date(startDate);
+        dueDate.setMonth(dueDate.getMonth() + cycleMonths * (i - 1));
 
-          payments.push([
-            contractId,
-            i,
-            data.periodic_rent_payment,
-            dueDate.toISOString().slice(0, 10),
-            'غير مدفوعة'
-          ]);
-        }
-
-        const paymentsQuery = `
-          INSERT INTO payments (contract_id, payment_number, payment_amount, due_date, payment_status)
-          VALUES ?
-        `;
-
-        db.query(paymentsQuery, [payments], (paymentsErr) => {
-          if (paymentsErr) {
-            console.error('❌ Payments DB Error:', paymentsErr);
-            return res.status(500).json({ message: 'تم حفظ العقد، لكن فشل في إنشاء الدفعات' });
-          }
-
-          // تحديث الاشتراك إذا موجود مسبقًا
-          const updateSubscriptionQuery = `
-            UPDATE rental_contracts
-            SET contract_start = ?, contract_end = ?, status = 'active', created_at = NOW()
-            WHERE tenant_id = ?
-          `;
-
-          db.query(updateSubscriptionQuery, [
-            data.contract_start,
-            data.contract_end,
-            tenantId
-          ], (updateErr, updateResult) => {
-            if (updateErr) {
-              console.error('❌ فشل في تحديث الاشتراك:', updateErr);
-              return res.status(500).json({ message: 'تم حفظ العقد، لكن فشل تحديث الاشتراك' });
-            }
-
-            if (updateResult.affectedRows === 0) {
-              const subscriptionData = {
-                tenant_id: tenantId,
-                property_name: "عقار مستأجر",
-                rent_amount: data.periodic_rent_payment,
-                contract_start: data.contract_start,
-                contract_end: data.contract_end,
-                status: 'active',
-                created_at: new Date(),
-              };
-
-              const subscriptionQuery = 'INSERT INTO rental_contracts SET ?';
-
-              db.query(subscriptionQuery, subscriptionData, (insertSubErr) => {
-                if (insertSubErr) {
-                  console.error('❌ Subscription DB Error:', insertSubErr);
-                  return res.status(500).json({ message: 'تم حفظ العقد لكن فشل في إنشاء الاشتراك' });
-                }
-
-                // نجاح الإدخال مع إنشاء اشتراك جديد
-                res.json({
-                  message: '✅ تم تحليل وتخزين العقد وإنشاء الاشتراك بنجاح',
-                  contract_number: data.contract_number
-                });
-              });
-
-            } else {
-              // نجاح التحديث
-              res.json({
-                message: '✅ تم تحليل وتخزين العقد وتحديث الاشتراك بنجاح',
-                contract_number: data.contract_number
-              });
-            }
-          });
-        });
-      };
-
-      if (checkResults.length > 0) {
-        console.log('🔵 غرفة الدردشة موجودة مسبقًا.');
-        createPaymentsAndSubscriptions(); // تابع العمليات
-      } else {
-        // إدخال غرفة دردشة جديدة
-        const chatRoomQuery = `
-          INSERT INTO chat_rooms (contract_id, tenant_user_id, admin_user_id)
-          VALUES (?, ?, ?)
-        `;
-
-        db.query(chatRoomQuery, [
+        payments.push([
           contractId,
-          tenantUserId,
-          adminUserId
-        ], (chatRoomErr) => {
-          if (chatRoomErr) {
-            console.error('❌ خطأ في إنشاء غرفة الدردشة:', chatRoomErr);
-            return res.status(500).json({ message: 'تم حفظ العقد ولكن فشل إنشاء غرفة الدردشة' });
-          }
+          i,
+          data.periodic_rent_payment,
+          dueDate.toISOString().slice(0, 10),
+          'غير مدفوعة'
+        ]);
+      }
 
-          console.log('✅ تم إنشاء غرفة الدردشة بنجاح.');
-          createPaymentsAndSubscriptions(); // تابع العمليات
+      const paymentsQuery = `
+        INSERT INTO payments (contract_id, payment_number, payment_amount, due_date, payment_status)
+        VALUES ?
+      `;
+
+      try {
+        await query(paymentsQuery, [payments]);
+      } catch (paymentsErr) {
+        console.error('❌ Payments DB Error:', paymentsErr);
+        return res.status(500).json({ message: 'تم حفظ العقد، لكن فشل في إنشاء الدفعات' });
+      }
+
+      const updateSubscriptionQuery = `
+        UPDATE rental_contracts SET contract_start = ?, contract_end = ?, status = 'active', created_at = NOW()
+        WHERE tenant_id = ?
+      `;
+
+      const updateResult = await query(updateSubscriptionQuery, [
+        data.contract_start,
+        data.contract_end,
+        tenantId
+      ]);
+
+      if (updateResult.affectedRows === 0) {
+        const subscriptionData = {
+          tenant_id: tenantId,
+          property_name: "عقار مستأجر",
+          rent_amount: data.periodic_rent_payment,
+          contract_start: data.contract_start,
+          contract_end: data.contract_end,
+          status: 'active',
+          created_at: new Date(),
+        };
+
+        const subscriptionQuery = 'INSERT INTO rental_contracts SET ?';
+
+        try {
+          await query(subscriptionQuery, subscriptionData);
+          res.json({
+            message: '✅ تم تحليل وتخزين العقد وإنشاء الاشتراك بنجاح',
+            contract_number: data.contract_number
+          });
+        } catch (insertSubErr) {
+          console.error('❌ Subscription DB Error:', insertSubErr);
+          return res.status(500).json({ message: 'تم حفظ العقد لكن فشل في إنشاء الاشتراك' });
+        }
+      } else {
+        res.json({
+          message: '✅ تم تحليل وتخزين العقد وتحديث الاشتراك بنجاح',
+          contract_number: data.contract_number
         });
       }
-    });
-  });
-});
+    };
 
-  
+    if (checkResults.length > 0) {
+      console.log('🔵 غرفة الدردشة موجودة مسبقًا.');
+      await createPaymentsAndSubscriptions();
+    } else {
+      const chatRoomQuery = `
+        INSERT INTO chat_rooms (contract_id, tenant_user_id, admin_user_id)
+        VALUES (?, ?, ?)
+      `;
+      try {
+        await query(chatRoomQuery, [contractId, tenantUserId, adminUserId]);
+        console.log('✅ تم إنشاء غرفة الدردشة بنجاح.');
+        await createPaymentsAndSubscriptions();
+      } catch (chatRoomErr) {
+        console.error('❌ خطأ في إنشاء غرفة الدردشة:', chatRoomErr);
+        return res.status(500).json({ message: 'تم حفظ العقد ولكن فشل إنشاء غرفة الدردشة' });
+      }
+    }
   } catch (err) {
     console.error('❌ PDF Analyze Error:', err);
     res.status(500).json({ message: 'فشل في تحليل الـ PDF' });
   }
-  
-  });
-
-
+});
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-app.get('/api/profile/contract/:userId', verifyToken, (req, res) => {
+app.get('/api/profile/contract/:userId', verifyToken, async (req, res) => {
   const userId = req.params.userId;
 
-  const query = `
+  const sql = `
     SELECT 
       contract_number, contract_type, contract_date, 
       contract_start, contract_end, contract_location
@@ -721,20 +707,26 @@ app.get('/api/profile/contract/:userId', verifyToken, (req, res) => {
     WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)
     LIMIT 1;
   `;
-  
-  db.query(query, [userId], (err, results) => {
-    if(err) return res.status(500).json({ message: 'خطأ في الخادم' });
-    if(results.length === 0) return res.status(404).json({ message: 'لا توجد بيانات' });
+
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0)
+      return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
-  });
+
+  } catch (err) {
+    console.error('❌ Profile-contract Error:', err);
+    res.status(500).json({ message: 'خطأ في الخادم' });
+  }
 });
 
 
-app.get('/api/profile/owner/:userId', verifyToken, (req, res) => {
+app.get('/api/profile/owner/:userId', verifyToken, async (req, res) => {
   const userId = req.params.userId;
 
-  const query = `
+  const sql = `
     SELECT 
       owner_name, owner_nationality, owner_id_type, 
       owner_id_number, owner_email, owner_phone, owner_address
@@ -742,21 +734,28 @@ app.get('/api/profile/owner/:userId', verifyToken, (req, res) => {
     WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)
     LIMIT 1;
   `;
-  
-  db.query(query, [userId], (err, results) => {
-    if(err) return res.status(500).json({ message: 'خطأ في الخادم' });
-    if(results.length === 0) return res.status(404).json({ message: 'لا توجد بيانات' });
+
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0)
+      return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
-  });
+
+  } catch (err) {
+    console.error('❌ Profile-owner Error:', err);
+    res.status(500).json({ message: 'خطأ في الخادم' });
+  }
 });
 
 
 
-app.get('/api/profile/tenant/:userId', verifyToken, (req, res) => {
+
+app.get('/api/profile/tenant/:userId', verifyToken, async (req, res) => {
   const userId = req.params.userId;
 
-  const query = `
+  const sql = `
     SELECT 
       tenant_name, tenant_nationality, tenant_id_type, 
       tenant_id_number, tenant_email, tenant_phone, tenant_address
@@ -764,20 +763,27 @@ app.get('/api/profile/tenant/:userId', verifyToken, (req, res) => {
     WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)
     LIMIT 1;
   `;
-  
-  db.query(query, [userId], (err, results) => {
-    if(err) return res.status(500).json({ message: 'خطأ في الخادم' });
-    if(results.length === 0) return res.status(404).json({ message: 'لا توجد بيانات' });
+
+  try {
+    const results = await query(sql, [userId]);
+
+    if(results.length === 0) 
+      return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
-  });
+
+  } catch(err) {
+    console.error('❌ Profile-tenant Error:', err);
+    res.status(500).json({ message: 'خطأ في الخادم' });
+  }
 });
 
 
-app.get('/api/profile/property/:userId', verifyToken, (req, res) => {
+
+app.get('/api/profile/property/:userId', verifyToken, async (req, res) => {
   const userId = req.params.userId;
 
-  const query = `
+  const sql = `
     SELECT 
       property_national_address, property_building_type, property_usage,
       property_units_count, property_floors_count
@@ -785,20 +791,29 @@ app.get('/api/profile/property/:userId', verifyToken, (req, res) => {
     WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)
     LIMIT 1;
   `;
-  
-  db.query(query, [userId], (err, results) => {
-    if(err) return res.status(500).json({ message: 'خطأ في الخادم' });
-    if(results.length === 0) return res.status(404).json({ message: 'لا توجد بيانات' });
+
+  try {
+    const results = await query(sql, [userId]);
+
+    if(results.length === 0) 
+      return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
-  });
+
+  } catch(err) {
+    console.error('❌ Profile-property Error:', err);
+    res.status(500).json({ message: 'خطأ في الخادم' });
+  }
 });
 
 
-app.get('/api/profile/unit/:userId', verifyToken, (req, res) => {
+
+
+
+app.get('/api/profile/unit/:userId', verifyToken, async (req, res) => {
   const userId = req.params.userId;
 
-  const query = `
+  const sql = `
     SELECT 
       unit_type, unit_number, unit_floor_number, unit_area,
       unit_furnishing_status, unit_ac_units_count, unit_ac_type
@@ -806,21 +821,27 @@ app.get('/api/profile/unit/:userId', verifyToken, (req, res) => {
     WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)
     LIMIT 1;
   `;
-  
-  db.query(query, [userId], (err, results) => {
-    if(err) return res.status(500).json({ message: 'خطأ في الخادم' });
-    if(results.length === 0) return res.status(404).json({ message: 'لا توجد بيانات' });
+
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0) 
+      return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
-  });
+
+  } catch(err) {
+    console.error('❌ Profile-unit Error:', err);
+    res.status(500).json({ message: 'خطأ في الخادم' });
+  }
 });
 
 
 
-app.get('/api/profile/finance/:userId', verifyToken, (req, res) => {
+app.get('/api/profile/finance/:userId', verifyToken, async (req, res) => {
   const userId = req.params.userId;
 
-  const query = `
+  const sql = `
     SELECT 
       annual_rent, periodic_rent_payment, rent_payment_cycle, 
       rent_payments_count, total_contract_value
@@ -828,70 +849,76 @@ app.get('/api/profile/finance/:userId', verifyToken, (req, res) => {
     WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)
     LIMIT 1;
   `;
-  
-  db.query(query, [userId], (err, results) => {
-    if(err) return res.status(500).json({ message: 'خطأ في الخادم' });
-    if(results.length === 0) return res.status(404).json({ message: 'لا توجد بيانات' });
+
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0)
+      return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
-  });
+
+  } catch(err) {
+    console.error('❌ Profile-finance Error:', err);
+    res.status(500).json({ message: 'خطأ في الخادم' });
+  }
 });
 
 
 
-app.get('/api/profile/privacy/:userId', verifyToken, (req, res) => {
+app.get('/api/profile/privacy/:userId', verifyToken, async (req, res) => {
   const userId = req.params.userId;
 
-  const query = `
+  const sql = `
     SELECT terms_conditions, privacy_policy
     FROM rental_contracts_details 
     WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)
     LIMIT 1;
   `;
-  
-  db.query(query, [userId], (err, results) => {
-    if(err) return res.status(500).json({ message: 'خطأ في الخادم' });
-    if(results.length === 0) return res.status(404).json({ message: 'لا توجد بيانات' });
+
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0) 
+      return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
-  });
+
+  } catch(err) {
+    console.error('❌ Profile-privacy Error:', err);
+    res.status(500).json({ message: 'خطأ في الخادم' });
+  }
 });
-
-
-
-
-
-
 
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-app.put('/api/payments/:paymentId', verifyToken, (req, res) => {
+app.put('/api/payments/:paymentId', verifyToken, async (req, res) => {
   const { paymentId } = req.params;
   const { payment_status, paid_date, payment_note } = req.body;
 
-  const updateQuery = `
+  const sql = `
     UPDATE payments SET payment_status = ?, paid_date = ?, payment_note = ?
     WHERE id = ?
   `;
 
-  db.query(updateQuery, [payment_status, paid_date, payment_note, paymentId], (err) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ message: 'خطأ في تحديث الدفعة' });
-    }
-
+  try {
+    await query(sql, [payment_status, paid_date, payment_note, paymentId]);
     res.json({ message: 'تم تحديث الدفعة بنجاح' });
-  });
+
+  } catch (err) {
+    console.error('❌ Payments-update Error:', err);
+    res.status(500).json({ message: 'خطأ في تحديث الدفعة' });
+  }
 });
 
 
 
-app.get('/api/payment-stats/:tenantId', verifyToken, (req, res) => {
+app.get('/api/payment-stats/:tenantId', verifyToken, async (req, res) => {
   const tenantId = req.params.tenantId;
 
-  const query = `
+  const sql = `
     SELECT p.payment_number, p.payment_amount, p.due_date, p.payment_status
     FROM payments p
     JOIN rental_contracts_details r ON p.contract_id = r.id
@@ -899,113 +926,108 @@ app.get('/api/payment-stats/:tenantId', verifyToken, (req, res) => {
     ORDER BY p.payment_number;
   `;
 
-  db.query(query, [tenantId], (err, payments) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ message: 'خطأ في جلب بيانات الدفعات' });
-    }
-
+  try {
+    const payments = await query(sql, [tenantId]);
     res.json({ payments });
-  });
+
+  } catch (err) {
+    console.error('❌ Payment-stats Error:', err);
+    res.status(500).json({ message: 'خطأ في جلب بيانات الدفعات' });
+  }
 });
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-app.post('/api/messages/send', verifyToken, (req, res) => {
+app.post('/api/messages/send', verifyToken, async (req, res) => {
   const { chatRoomId, senderId, receiverId, message } = req.body;
 
-  // جلب contract_id من جدول chat_rooms
-  const getContractQuery = `SELECT contract_id FROM chat_rooms WHERE id = ?`;
+  const getContractSql = `SELECT contract_id FROM chat_rooms WHERE id = ?`;
+  const insertMessageSql = `
+    INSERT INTO messages (contract_id, chat_room_id, sender_id, receiver_id, message)
+    VALUES (?, ?, ?, ?, ?)
+  `;
 
-  db.query(getContractQuery, [chatRoomId], (err, results) => {
-    if (err || results.length === 0) {
-      console.error('خطأ في إيجاد العقد', err);
+  try {
+    const results = await query(getContractSql, [chatRoomId]);
+    
+    if (results.length === 0) {
+      console.error('خطأ في إيجاد العقد');
       return res.status(500).json({ message: 'خطأ في إيجاد العقد المرتبط بغرفة الدردشة' });
     }
 
     const contractId = results[0].contract_id;
 
-    const query = `
-      INSERT INTO messages (contract_id, chat_room_id, sender_id, receiver_id, message)
-      VALUES (?, ?, ?, ?, ?)
-    `;
+    await query(insertMessageSql, [contractId, chatRoomId, senderId, receiverId, message]);
+    res.status(200).json({ message: 'تم الإرسال بنجاح' });
 
-    db.query(query, [contractId, chatRoomId, senderId, receiverId, message], (err) => {
-      if (err) {
-        console.error('خطأ في إرسال الرسالة:', err);
-        return res.status(500).json({ message: 'خطأ في إرسال الرسالة' });
-      }
-
-      res.status(200).json({ message: 'تم الإرسال بنجاح' });
-    });
-  });
+  } catch (err) {
+    console.error('❌ Send-message Error:', err);
+    res.status(500).json({ message: 'خطأ في إرسال الرسالة' });
+  }
 });
 
 
 
-app.get('/api/messages/:chatRoomId', verifyToken, (req, res) => {
+app.get('/api/messages/:chatRoomId', verifyToken, async (req, res) => {
   const { chatRoomId } = req.params;
-  const userId = req.user.userId; // 👈 استخدم هذا المفتاح فقط.
+  const userId = req.user.userId;
 
   console.log('القيم التي يتم التحقق منها:', { chatRoomId, userId });
 
-  const checkQuery = `
+  const checkSql = `
     SELECT * FROM chat_rooms 
     WHERE id = ? AND (tenant_user_id = ? OR admin_user_id = ?)
   `;
+  
+  const messagesSql = `
+    SELECT * FROM messages
+    WHERE chat_room_id = ?
+    ORDER BY timestamp ASC
+  `;
 
-  db.query(checkQuery, [chatRoomId, userId, userId], (checkErr, checkResult) => {
-    if (checkErr || checkResult.length === 0) {
-      console.error('خطأ صلاحيات الوصول:', checkErr, checkResult);
+  try {
+    const checkResult = await query(checkSql, [chatRoomId, userId, userId]);
+    
+    if (checkResult.length === 0) {
+      console.error('خطأ صلاحيات الوصول:', checkResult);
       return res.status(403).json({ message: 'لا يسمح لك بالوصول لهذه الرسائل' });
     }
 
-    const query = `
-      SELECT * FROM messages
-      WHERE chat_room_id = ?
-      ORDER BY timestamp ASC
-    `;
+    const messages = await query(messagesSql, [chatRoomId]);
+    res.status(200).json({ messages });
 
-    db.query(query, [chatRoomId], (err, messages) => {
-      if (err) {
-        console.error(err);
-        return res.status(500).json({ message: 'خطأ في جلب الرسائل' });
-      }
-
-      res.status(200).json({ messages });
-    });
-  });
+  } catch (err) {
+    console.error('❌ Get-messages Error:', err);
+    res.status(500).json({ message: 'خطأ في جلب الرسائل' });
+  }
 });
 
 
-
-
-app.put('/api/messages/read/:messageId', verifyToken, (req, res) => {
+app.put('/api/messages/read/:messageId', verifyToken, async (req, res) => {
   const { messageId } = req.params;
 
-  const query = `
+  const sql = `
     UPDATE messages SET is_read = TRUE WHERE id = ?
   `;
 
-  db.query(query, [messageId], (err) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ message: 'خطأ في تحديث حالة القراءة' });
-    }
-
+  try {
+    await query(sql, [messageId]);
     res.status(200).json({ message: 'تم تحديث حالة الرسالة' });
-  });
-});
 
+  } catch (err) {
+    console.error('❌ Update-message-read Error:', err);
+    res.status(500).json({ message: 'خطأ في تحديث حالة القراءة' });
+  }
+});
 
 
 
 // Endpoint لجلب بيانات غرفة الدردشة للمستأجر
-app.get('/api/chat-room/tenant/:tenantId', verifyToken, (req, res) => {
+app.get('/api/chat-room/tenant/:tenantId', verifyToken, async (req, res) => {
   const { tenantId } = req.params;
 
-  const query = `
+  const sql = `
     SELECT cr.id AS chat_room_id, cr.admin_user_id AS owner_user_id, u.name AS owner_name
     FROM chat_rooms cr
     JOIN users u ON cr.admin_user_id = u.user_id
@@ -1013,14 +1035,19 @@ app.get('/api/chat-room/tenant/:tenantId', verifyToken, (req, res) => {
     LIMIT 1
   `;
 
-  db.query(query, [tenantId], (err, results) => {
-    if (err || results.length === 0) {
-      console.error(err);
+  try {
+    const results = await query(sql, [tenantId]);
+
+    if (results.length === 0) {
       return res.status(404).json({ message: 'لم يتم العثور على غرفة دردشة' });
     }
 
     res.status(200).json(results[0]);
-  });
+
+  } catch (err) {
+    console.error('❌ Chat-room-tenant Error:', err);
+    res.status(500).json({ message: 'خطأ في جلب بيانات غرفة الدردشة' });
+  }
 });
 
 
@@ -1029,8 +1056,7 @@ app.get('/api/chat-room/tenant/:tenantId', verifyToken, (req, res) => {
 // 📁 index.js أو ملف routes المناسب
 // 📁 index.js أو ملف routes المناسب
 const { JWT } = require('google-auth-library');
-
-const serviceAccount = require('./firebase/firebase-service-account.json'); // مسار ملف JSON من Firebase
+const serviceAccount = require('./firebase/firebase-service-account.json');
 
 // دالة لجلب التوكن من Google
 async function getAccessToken() {
@@ -1044,7 +1070,6 @@ async function getAccessToken() {
   const tokens = await jwtClient.authorize();
   return tokens.access_token;
 }
-// إعدادات Firebase Admin SDK
 
 // ✅ API لإرسال إشعار عبر FCM V1
 app.post('/api/send-notification', verifyToken, async (req, res) => {
@@ -1063,8 +1088,8 @@ app.post('/api/send-notification', verifyToken, async (req, res) => {
 
   // 📌 حالة فردية
   if (userId) {
-    const query = 'SELECT fcm_token FROM users WHERE user_id = ?';
-    const [result] = await db.promise().query(query, [userId]);
+    const sql = 'SELECT fcm_token FROM users WHERE user_id = ?';
+    const result = await query(sql, [userId]);
     if (result.length && result[0].fcm_token) {
       tokens.push({ token: result[0].fcm_token, userId });
     }
@@ -1073,15 +1098,15 @@ app.post('/api/send-notification', verifyToken, async (req, res) => {
   // 📌 حالة متعددة محددة
   else if (Array.isArray(userIds)) {
     const placeholders = userIds.map(() => '?').join(',');
-    const query = `SELECT user_id, fcm_token FROM users WHERE user_id IN (${placeholders})`;
-    const [results] = await db.promise().query(query, userIds);
+    const sql = `SELECT user_id, fcm_token FROM users WHERE user_id IN (${placeholders})`;
+    const results = await query(sql, userIds);
     tokens = results.filter(row => row.fcm_token).map(row => ({ token: row.fcm_token, userId: row.user_id }));
   }
 
   // 📌 حالة حسب نوع المستخدم (admins أو users)
   else if (targetType) {
-    const query = `SELECT user_id, fcm_token FROM users WHERE user_type = ?`;
-    const [results] = await db.promise().query(query, [targetType]);
+    const sql = `SELECT user_id, fcm_token FROM users WHERE user_type = ?`;
+    const results = await query(sql, [targetType]);
     tokens = results.filter(row => row.fcm_token).map(row => ({ token: row.fcm_token, userId: row.user_id }));
   }
 
@@ -1089,22 +1114,16 @@ app.post('/api/send-notification', verifyToken, async (req, res) => {
     return res.status(404).json({ message: '❌ لم يتم العثور على مستلمين صالحين' });
   }
 
-  // إرسال لكل واحد
   const accessToken = await getAccessToken();
+
   for (const { token, userId } of tokens) {
     const message = {
-  message: {
-    token,
-    notification: {
-      title,
-      body,
-    },
-    data: {
-      screen: 'notifications',
-      userId: userId
-    }
-  }
-};
+      message: {
+        token,
+        notification: { title, body },
+        data: { screen: 'notifications', userId }
+      }
+    };
 
     try {
       await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
@@ -1116,13 +1135,15 @@ app.post('/api/send-notification', verifyToken, async (req, res) => {
         body: JSON.stringify(message),
       });
 
-      // حفظ الإشعار
-      await db.promise().query(
-        'INSERT INTO notifications (user_id, title, body) VALUES (?, ?, ?)',
-        [userId, title, body]
-      );
+      // حفظ الإشعار في قاعدة البيانات
+      const insertNotificationSql = `
+        INSERT INTO notifications (user_id, title, body)
+        VALUES (?, ?, ?)
+      `;
+      await query(insertNotificationSql, [userId, title, body]);
+
     } catch (err) {
-      console.error(`فشل الإرسال لـ ${userId}`, err);
+      console.error(`❌ فشل الإرسال لـ ${userId}`, err);
     }
   }
 
@@ -1133,51 +1154,61 @@ app.post('/api/send-notification', verifyToken, async (req, res) => {
 
 
 
+
 // ✅ API: جلب إشعارات مستخدم معين
-app.get('/api/notifications/:userId', verifyToken, (req, res) => {
+app.get('/api/notifications/:userId', verifyToken, async (req, res) => {
   const { userType, userId: requesterId } = req.user;
   const { userId } = req.params;
 
-  // فقط السوبر أو نفس المستخدم يقدر يشوف إشعاراته
   if (userId !== requesterId && userType !== 'super') {
     return res.status(403).json({ message: '❌ ليس لديك صلاحية لعرض هذه الإشعارات' });
   }
 
-  const query = `
+  const sql = `
     SELECT id, title, body, is_read, created_at
     FROM notifications
     WHERE user_id = ?
     ORDER BY created_at DESC
   `;
 
-  db.query(query, [userId], (err, results) => {
-    if (err) return res.status(500).json({ message: 'خطأ في جلب الإشعارات' });
-    res.json({ notifications: results });
-  });
+  try {
+    const notifications = await query(sql, [userId]);
+    res.json({ notifications });
+
+  } catch (err) {
+    console.error('❌ Notifications-fetch Error:', err);
+    res.status(500).json({ message: 'خطأ في جلب الإشعارات' });
+  }
 });
 
+
 // ✅ API: تعليم الإشعار كمقروء
-app.put('/api/notifications/:id/read', verifyToken, (req, res) => {
+app.put('/api/notifications/:id/read', verifyToken, async (req, res) => {
   const { id } = req.params;
   const { userId } = req.user;
 
-  const checkQuery = 'SELECT user_id FROM notifications WHERE id = ?';
+  const checkSql = 'SELECT user_id FROM notifications WHERE id = ?';
+  const updateSql = 'UPDATE notifications SET is_read = TRUE WHERE id = ?';
 
-  db.query(checkQuery, [id], (err, results) => {
-    if (err || results.length === 0 || results[0].user_id !== userId) {
+  try {
+    const results = await query(checkSql, [id]);
+
+    if (results.length === 0 || results[0].user_id !== userId) {
       return res.status(403).json({ message: '❌ لا يمكن تعديل هذا الإشعار' });
     }
 
-    const updateQuery = 'UPDATE notifications SET is_read = TRUE WHERE id = ?';
-    db.query(updateQuery, [id], (updateErr) => {
-      if (updateErr) return res.status(500).json({ message: 'فشل التحديث' });
-      res.json({ message: '✅ تم التعليم كمقروء' });
-    });
-  });
+    await query(updateSql, [id]);
+    res.json({ message: '✅ تم التعليم كمقروء' });
+
+  } catch (err) {
+    console.error('❌ Notifications-read Error:', err);
+    res.status(500).json({ message: 'فشل التحديث' });
+  }
 });
 
+
 // ✅ API: تفعيل اشتراك للمُلاك (admin) من السوبر فقط
-app.post('/api/activate-subscription', verifyToken, (req, res) => {
+app.post('/api/activate-subscription', verifyToken, async (req, res) => {
   const { userType } = req.user;
   const { adminId, startDate, endDate } = req.body;
 
@@ -1189,32 +1220,43 @@ app.post('/api/activate-subscription', verifyToken, (req, res) => {
     return res.status(400).json({ message: 'يجب إرسال adminId و startDate و endDate' });
   }
 
-  const insertQuery = `
+  const sql = `
     INSERT INTO admin_subscriptions (admin_id, start_date, end_date)
     VALUES (?, ?, ?)
     ON DUPLICATE KEY UPDATE start_date = VALUES(start_date), end_date = VALUES(end_date)
   `;
 
-  db.query(insertQuery, [adminId, startDate, endDate], (err) => {
-    if (err) return res.status(500).json({ message: '❌ فشل في تفعيل الاشتراك' });
+  try {
+    await query(sql, [adminId, startDate, endDate]);
     res.json({ message: '✅ تم تفعيل أو تحديث الاشتراك للمُـلك' });
-  });
+
+  } catch (err) {
+    console.error('❌ Subscription-activation Error:', err);
+    res.status(500).json({ message: '❌ فشل في تفعيل الاشتراك' });
+  }
 });
 
 
 
-app.post('/api/save-device-token', verifyToken, (req, res) => {
+app.post('/api/save-device-token', verifyToken, async (req, res) => {
   const { userId, deviceToken } = req.body;
+
   if (!userId || !deviceToken) {
     return res.status(400).json({ message: 'userId و deviceToken مطلوبين' });
   }
 
-  const query = `UPDATE users SET fcm_token = ? WHERE user_id = ?`;
-  db.query(query, [deviceToken, userId], (err) => {
-    if (err) return res.status(500).json({ message: 'فشل في حفظ التوكن' });
+  const sql = `UPDATE users SET fcm_token = ? WHERE user_id = ?`;
+
+  try {
+    await query(sql, [deviceToken, userId]);
     res.json({ message: '✅ تم حفظ FCM Token بنجاح' });
-  });
+
+  } catch (err) {
+    console.error('❌ Save-device-token Error:', err);
+    res.status(500).json({ message: 'فشل في حفظ التوكن' });
+  }
 });
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -1229,37 +1271,41 @@ app.post('/api/maintenance-request', verifyToken, async (req, res) => {
 
   try {
     // 1. جلب tenant_id من جدول users
-    const [[userRow]] = await db.promise().query(
-      'SELECT id FROM users WHERE user_id = ?',
-      [userId]
-    );
-    if (!userRow) return res.status(404).json({ message: 'المستخدم غير موجود' });
-    const tenantId = userRow.id;
+    const userSql = 'SELECT id FROM users WHERE user_id = ?';
+    const userRows = await query(userSql, [userId]);
+    if (userRows.length === 0) {
+      return res.status(404).json({ message: 'المستخدم غير موجود' });
+    }
+    const tenantId = userRows[0].id;
 
     // 2. جلب admin_id المرتبط بالمستأجر من آخر عقد
-    const [[contractRow]] = await db.promise().query(
-      'SELECT admin_id FROM rental_contracts_details WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1',
-      [tenantId]
-    );
-    if (!contractRow) return res.status(404).json({ message: 'لا يوجد عقد مرتبط بهذا المستخدم' });
-    const ownerId = contractRow.admin_id;
+    const contractSql = `
+      SELECT admin_id FROM rental_contracts_details 
+      WHERE tenant_id = ? 
+      ORDER BY created_at DESC LIMIT 1
+    `;
+    const contractRows = await query(contractSql, [tenantId]);
+    if (contractRows.length === 0) {
+      return res.status(404).json({ message: 'لا يوجد عقد مرتبط بهذا المستخدم' });
+    }
+    const ownerId = contractRows[0].admin_id;
 
     // 3. إنشاء الطلب
-    await db.promise().query(
-      'INSERT INTO maintenance_requests (tenant_id, owner_id, category, description) VALUES (?, ?, ?, ?)',
-      [tenantId, ownerId, category, description || '']
-    );
+    const insertSql = `
+      INSERT INTO maintenance_requests (tenant_id, owner_id, category, description) 
+      VALUES (?, ?, ?, ?)
+    `;
+    await query(insertSql, [tenantId, ownerId, category, description || '']);
 
     // 4. جلب fcm_token للمالك
-    const [[ownerRow]] = await db.promise().query(
-      'SELECT fcm_token FROM users WHERE id = ?',
-      [ownerId]
-    );
-    if (ownerRow && ownerRow.fcm_token) {
+    const ownerSql = 'SELECT fcm_token FROM users WHERE id = ?';
+    const ownerRows = await query(ownerSql, [ownerId]);
+
+    if (ownerRows.length > 0 && ownerRows[0].fcm_token) {
       const accessToken = await getAccessToken();
       const message = {
         message: {
-          token: ownerRow.fcm_token,
+          token: ownerRows[0].fcm_token,
           notification: {
             title: 'طلب صيانة جديد',
             body: `هناك بلاغ صيانة: ${category}`,
@@ -1281,11 +1327,13 @@ app.post('/api/maintenance-request', verifyToken, async (req, res) => {
     }
 
     res.json({ message: '✅ تم إرسال طلب الصيانة بنجاح' });
+
   } catch (err) {
     console.error('❌ Maintenance Request Error:', err);
     res.status(500).json({ message: 'فشل في إرسال الطلب' });
   }
 });
+
 
 
 
@@ -1296,22 +1344,25 @@ app.get('/api/maintenance-history/:userId', verifyToken, async (req, res) => {
 
   try {
     // 1. جلب tenant_id من جدول users
-    const [[userRow]] = await db.promise().query(
-      'SELECT id FROM users WHERE user_id = ?',
-      [userId]
-    );
-    if (!userRow) return res.status(404).json({ message: 'المستخدم غير موجود' });
+    const userSql = 'SELECT id FROM users WHERE user_id = ?';
+    const userRows = await query(userSql, [userId]);
+    if (userRows.length === 0) {
+      return res.status(404).json({ message: 'المستخدم غير موجود' });
+    }
+
+    const tenantId = userRows[0].id;
 
     // 2. جلب سجل الطلبات لهذا المستأجر
-    const [history] = await db.promise().query(
-      `SELECT category, description, status, created_at
-       FROM maintenance_requests
-       WHERE tenant_id = ?
-       ORDER BY created_at DESC`,
-      [userRow.id]
-    );
+    const historySql = `
+      SELECT category, description, status, created_at
+      FROM maintenance_requests
+      WHERE tenant_id = ?
+      ORDER BY created_at DESC
+    `;
+    const history = await query(historySql, [tenantId]);
 
     res.json({ history });
+
   } catch (err) {
     console.error('❌ Maintenance History Error:', err);
     res.status(500).json({ message: 'حدث خطأ أثناء جلب سجل الصيانة' });
@@ -1324,34 +1375,40 @@ app.get('/api/last-maintenance-request', verifyToken, async (req, res) => {
   const { userId } = req.user;
 
   try {
-    const [[userRow]] = await db.promise().query(
-      'SELECT id FROM users WHERE user_id = ?',
-      [userId]
-    );
-    if (!userRow) return res.status(404).json({ message: 'المستخدم غير موجود' });
+    // جلب tenant_id من جدول users
+    const userSql = 'SELECT id FROM users WHERE user_id = ?';
+    const userRows = await query(userSql, [userId]);
+    if (userRows.length === 0) {
+      return res.status(404).json({ message: 'المستخدم غير موجود' });
+    }
 
-    const tenantId = userRow.id;
+    const tenantId = userRows[0].id;
 
-    const [[requestRow]] = await db.promise().query(
-      `SELECT category, description, status, created_at
-       FROM maintenance_requests
-       WHERE tenant_id = ?
-       ORDER BY created_at DESC LIMIT 1`,
-      [tenantId]
-    );
+    // جلب آخر طلب صيانة
+    const requestSql = `
+      SELECT category, description, status, created_at
+      FROM maintenance_requests
+      WHERE tenant_id = ?
+      ORDER BY created_at DESC LIMIT 1
+    `;
+    const requestRows = await query(requestSql, [tenantId]);
 
-    if (!requestRow) return res.status(404).json({ message: 'لا يوجد طلبات' });
+    if (requestRows.length === 0) {
+      return res.status(404).json({ message: 'لا يوجد طلبات' });
+    }
 
-    res.json(requestRow);
+    res.json(requestRows[0]);
+
   } catch (err) {
-    console.error(err);
+    console.error('❌ Last Maintenance Request Error:', err);
     res.status(500).json({ message: 'خطأ في استرجاع البيانات' });
   }
 });
 
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-app.post('/api/toggle-review-permission', verifyToken, (req, res) => {
+app.post('/api/toggle-review-permission', verifyToken, async (req, res) => {
   const { userType } = req.user;
   const { adminId, enabled } = req.body;
 
@@ -1359,18 +1416,21 @@ app.post('/api/toggle-review-permission', verifyToken, (req, res) => {
     return res.status(403).json({ message: '❌ فقط السوبر يمكنه تعديل صلاحيات المراجعات' });
   }
 
-  const query = `
+  const sql = `
     INSERT INTO review_permissions (admin_id, enabled)
     VALUES (?, ?)
     ON DUPLICATE KEY UPDATE enabled = VALUES(enabled)
   `;
 
-  db.query(query, [adminId, enabled], (err) => {
-    if (err) return res.status(500).json({ message: 'فشل في تعديل الصلاحية' });
+  try {
+    await query(sql, [adminId, enabled]);
     res.json({ message: '✅ تم تعديل الصلاحية بنجاح' });
-  });
-});
 
+  } catch (err) {
+    console.error('❌ Toggle-review-permission Error:', err);
+    res.status(500).json({ message: 'فشل في تعديل الصلاحية' });
+  }
+});
 
 
 
@@ -1383,20 +1443,24 @@ app.post('/api/reviews/add', verifyToken, async (req, res) => {
     return res.status(400).json({ message: 'يرجى إرسال تقييم بين 1 و5' });
   }
 
-  try {
-    await db.promise().query(
-      'INSERT INTO reviews (user_id, rating, comment) VALUES (?, ?, ?)',
-      [userId, rating, comment || '']
-    );
+  const insertReviewSql = `
+    INSERT INTO reviews (user_id, rating, comment)
+    VALUES (?, ?, ?)
+  `;
 
-    await db.promise().query(
-      'INSERT INTO review_points (user_id, points, source) VALUES (?, ?, ?)',
-      [userId, 10, 'إرسال تقييم']
-    );
+  const insertPointsSql = `
+    INSERT INTO review_points (user_id, points, source)
+    VALUES (?, ?, ?)
+  `;
+
+  try {
+    await query(insertReviewSql, [userId, rating, comment || '']);
+    await query(insertPointsSql, [userId, 10, 'إرسال تقييم']);
 
     res.json({ message: '✅ تم تسجيل تقييمك وحصلت على 10 نقاط!' });
+
   } catch (err) {
-    console.error('❌ Review Error:', err);
+    console.error('❌ Review-add Error:', err);
     res.status(500).json({ message: 'حدث خطأ أثناء إرسال التقييم' });
   }
 });
@@ -1407,47 +1471,55 @@ app.post('/api/reviews/add', verifyToken, async (req, res) => {
 app.get('/api/reviews/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
 
-  try {
-    const [[permission]] = await db.promise().query(
-      'SELECT enabled FROM review_permissions WHERE admin_id = ?',
-      [adminId]
-    );
+  const permissionSql = `
+    SELECT enabled FROM review_permissions WHERE admin_id = ?
+  `;
 
-    if (!permission || !permission.enabled) {
+  const reviewsSql = `
+    SELECT rating, comment, created_at FROM reviews 
+    WHERE visible = TRUE 
+    ORDER BY created_at DESC
+  `;
+
+  try {
+    const permissionResults = await query(permissionSql, [adminId]);
+
+    if (permissionResults.length === 0 || !permissionResults[0].enabled) {
       return res.status(403).json({ message: '❌ لا يملك المالك صلاحية عرض التقييمات' });
     }
 
-    const [reviews] = await db.promise().query(
-      'SELECT rating, comment, created_at FROM reviews WHERE visible = TRUE ORDER BY created_at DESC'
-    );
-
+    const reviews = await query(reviewsSql);
     res.json({ reviews });
+
   } catch (err) {
-    console.error('❌ Fetch Reviews Error:', err);
+    console.error('❌ Fetch-reviews Error:', err);
     res.status(500).json({ message: 'فشل في جلب التقييمات' });
   }
 });
-
+// ✅ API: جلب تقييمات المستخدمين (للمستخدم نفسه)
 
 
 
 // ✅ API: ترتيب المستخدمين حسب النقاط (شارت المنافسة)
 app.get('/api/review-stats', verifyToken, async (req, res) => {
-  try {
-    const [results] = await db.promise().query(`
-      SELECT u.user_id, u.name, SUM(rp.points) AS total_points
-      FROM review_points rp
-      JOIN users u ON u.user_id = rp.user_id
-      GROUP BY rp.user_id
-      ORDER BY total_points DESC
-    `);
+  const sql = `
+    SELECT u.user_id, u.name, SUM(rp.points) AS total_points
+    FROM review_points rp
+    JOIN users u ON u.user_id = rp.user_id
+    GROUP BY rp.user_id
+    ORDER BY total_points DESC
+  `;
 
-    res.json({ leaderboard: results });
+  try {
+    const leaderboard = await query(sql);
+    res.json({ leaderboard });
+
   } catch (err) {
-    console.error('❌ Review Stats Error:', err);
+    console.error('❌ Review-stats Error:', err);
     res.status(500).json({ message: 'فشل في جلب البيانات' });
   }
 });
+
 
 // ✅ API: تعديل النقاط يدويًا من لوحة الإدارة (فقط للسوبر أو المالك)
 app.post('/api/admin/update-review-points', verifyToken, async (req, res) => {
@@ -1462,18 +1534,21 @@ app.post('/api/admin/update-review-points', verifyToken, async (req, res) => {
     return res.status(400).json({ message: '❗ البيانات غير مكتملة أو غير صالحة' });
   }
 
-  try {
-    await db.promise().query(
-      'INSERT INTO review_points (user_id, points, source) VALUES (?, ?, ?)',
-      [userId, points, source || 'تعديل يدوي']
-    );
+  const sql = `
+    INSERT INTO review_points (user_id, points, source)
+    VALUES (?, ?, ?)
+  `;
 
+  try {
+    await query(sql, [userId, points, source || 'تعديل يدوي']);
     res.json({ message: '✅ تم تحديث النقاط للمستخدم بنجاح' });
+
   } catch (err) {
-    console.error('❌ Admin Points Update Error:', err);
+    console.error('❌ Admin-update-points Error:', err);
     res.status(500).json({ message: 'حدث خطأ أثناء تحديث النقاط' });
   }
 });
+
 
 
 
@@ -1481,23 +1556,27 @@ app.post('/api/admin/update-review-points', verifyToken, async (req, res) => {
 app.get('/api/user-review-summary/:userId', verifyToken, async (req, res) => {
   const { userId } = req.params;
 
-  try {
-    const [[pointsRow]] = await db.promise().query(
-      'SELECT SUM(points) AS total_points FROM review_points WHERE user_id = ?',
-      [userId]
-    );
+  const pointsSql = `
+    SELECT SUM(points) AS total_points FROM review_points WHERE user_id = ?
+  `;
 
-    const [reviews] = await db.promise().query(
-      'SELECT rating, comment, created_at FROM reviews WHERE user_id = ? ORDER BY created_at DESC',
-      [userId]
-    );
+  const reviewsSql = `
+    SELECT rating, comment, created_at FROM reviews 
+    WHERE user_id = ? 
+    ORDER BY created_at DESC
+  `;
+
+  try {
+    const pointsResults = await query(pointsSql, [userId]);
+    const reviews = await query(reviewsSql, [userId]);
 
     res.json({
-      total_points: pointsRow.total_points || 0,
+      total_points: pointsResults[0].total_points || 0,
       reviews,
     });
+
   } catch (err) {
-    console.error('❌ User Review Summary Error:', err);
+    console.error('❌ User-review-summary Error:', err);
     res.status(500).json({ message: 'فشل في جلب ملخص التقييمات' });
   }
 });
@@ -1505,10 +1584,10 @@ app.get('/api/user-review-summary/:userId', verifyToken, async (req, res) => {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-app.get('/api/download-contract/:userId', verifyToken, (req, res) => {
+app.get('/api/download-contract/:userId', verifyToken, async (req, res) => {
   const userId = req.params.userId;
 
-  const query = `
+  const sql = `
     SELECT pdf_path 
     FROM rental_contracts_details 
     WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)
@@ -1516,8 +1595,10 @@ app.get('/api/download-contract/:userId', verifyToken, (req, res) => {
     LIMIT 1;
   `;
 
-  db.query(query, [userId], (err, results) => {
-    if (err || results.length === 0) {
+  try {
+    const results = await query(sql, [userId]);
+
+    if (results.length === 0) {
       return res.status(404).json({ message: 'لم يتم العثور على ملف العقد' });
     }
 
@@ -1529,101 +1610,162 @@ app.get('/api/download-contract/:userId', verifyToken, (req, res) => {
         res.status(500).json({ message: 'حدث خطأ في تحميل الملف' });
       }
     });
-  });
+
+  } catch (err) {
+    console.error('❌ Download-contract Error:', err);
+    res.status(500).json({ message: 'حدث خطأ في الخادم' });
+  }
 });
+
 
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // ✅ 1. Get all services (for super admin)
-app.get('/api/services', verifyToken, (req, res) => {
+app.get('/api/services', verifyToken, async (req, res) => {
   const { userType } = req.user;
-  
+
   if (userType !== 'super') {
     return res.status(403).json({ message: 'صلاحية مفقودة' });
   }
-  db.query('SELECT * FROM dynamic_services', (err, results) => {
-    if (err) return res.status(500).json({ message: 'DB Error', err });
+
+  const sql = 'SELECT * FROM dynamic_services';
+
+  try {
+    const results = await query(sql);
     res.json(results);
-  });
+
+  } catch (err) {
+    console.error('❌ Get-services Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
 });
+
 
 // ✅ 2. Create new service (super only)
-app.post('/api/services', verifyToken, (req, res) => {
+app.post('/api/services', verifyToken, async (req, res) => {
   const { userType } = req.user;
+
   if (userType !== 'super') {
     return res.status(403).json({ message: 'غير مصرح' });
   }
+
   const { title, icon, description } = req.body;
-  const query = 'INSERT INTO dynamic_services (title, icon, description) VALUES (?, ?, ?)';
-  db.query(query, [title, icon, description], (err, result) => {
-    if (err) return res.status(500).json({ message: 'DB Error', err });
+  const sql = `
+    INSERT INTO dynamic_services (title, icon, description)
+    VALUES (?, ?, ?)
+  `;
+
+  try {
+    const result = await query(sql, [title, icon, description]);
     res.json({ message: 'تمت الإضافة بنجاح', id: result.insertId });
-  });
+
+  } catch (err) {
+    console.error('❌ Create-service Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
 });
+
 
 // ✅ 3. Toggle service active (super only)
-app.put('/api/services/:id/toggle', verifyToken, (req, res) => {
+app.put('/api/services/:id/toggle', verifyToken, async (req, res) => {
   const { userType } = req.user;
+
   if (userType !== 'super') {
     return res.status(403).json({ message: 'غير مصرح' });
   }
+
   const id = req.params.id;
-  const query = 'UPDATE dynamic_services SET is_active = NOT is_active WHERE id = ?';
-  db.query(query, [id], (err) => {
-    if (err) return res.status(500).json({ message: 'DB Error', err });
+  const sql = `
+    UPDATE dynamic_services SET is_active = NOT is_active WHERE id = ?
+  `;
+
+  try {
+    await query(sql, [id]);
     res.json({ message: 'تم التحديث بنجاح' });
-  });
+
+  } catch (err) {
+    console.error('❌ Toggle-service Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
 });
 
+
 // ✅ 4. Get admin's selected services
-app.get('/api/admin-services/:adminId', verifyToken, (req, res) => {
+app.get('/api/admin-services/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
-  const query = `
+
+  const sql = `
     SELECT ds.*, COALESCE(av.is_enabled, 0) as is_enabled
     FROM dynamic_services ds
     LEFT JOIN admin_service_visibility av
     ON ds.id = av.service_id AND av.admin_id = ?
     WHERE ds.is_active = 1
   `;
-  db.query(query, [adminId], (err, results) => {
-    if (err) return res.status(500).json({ message: 'DB Error', err });
+
+  try {
+    const results = await query(sql, [adminId]);
     res.json(results);
-  });
+
+  } catch (err) {
+    console.error('❌ Admin-services-fetch Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
 });
 
+
+
+
 // ✅ 5. Toggle service for admin
-app.post('/api/admin-services/toggle', verifyToken, (req, res) => {
+app.post('/api/admin-services/toggle', verifyToken, async (req, res) => {
   const { userType } = req.user;
+  
   if (userType !== 'admin' && userType !== 'super') {
     return res.status(403).json({ message: 'غير مصرح' });
   }
+
   const { adminId, serviceId } = req.body;
-  const checkQuery = 'SELECT * FROM admin_service_visibility WHERE admin_id = ? AND service_id = ?';
-  db.query(checkQuery, [adminId, serviceId], (err, rows) => {
-    if (err) return res.status(500).json({ message: 'DB Error', err });
-    if (rows.length) {
-      const toggleQuery = 'UPDATE admin_service_visibility SET is_enabled = NOT is_enabled WHERE admin_id = ? AND service_id = ?';
-      db.query(toggleQuery, [adminId, serviceId], (err) => {
-        if (err) return res.status(500).json({ message: 'DB Error', err });
-        res.json({ message: 'تم التحديث بنجاح' });
-      });
+
+  const checkSql = `
+    SELECT * FROM admin_service_visibility 
+    WHERE admin_id = ? AND service_id = ?
+  `;
+
+  const toggleSql = `
+    UPDATE admin_service_visibility 
+    SET is_enabled = NOT is_enabled 
+    WHERE admin_id = ? AND service_id = ?
+  `;
+
+  const insertSql = `
+    INSERT INTO admin_service_visibility (admin_id, service_id, is_enabled) 
+    VALUES (?, ?, 1)
+  `;
+
+  try {
+    const existingRows = await query(checkSql, [adminId, serviceId]);
+
+    if (existingRows.length) {
+      await query(toggleSql, [adminId, serviceId]);
+      res.json({ message: 'تم التحديث بنجاح' });
     } else {
-      const insertQuery = 'INSERT INTO admin_service_visibility (admin_id, service_id, is_enabled) VALUES (?, ?, 1)';
-      db.query(insertQuery, [adminId, serviceId], (err) => {
-        if (err) return res.status(500).json({ message: 'DB Error', err });
-        res.json({ message: 'تم التفعيل بنجاح' });
-      });
+      await query(insertSql, [adminId, serviceId]);
+      res.json({ message: 'تم التفعيل بنجاح' });
     }
-  });
+
+  } catch (err) {
+    console.error('❌ Admin-services-toggle Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
 });
+
 
 // ✅ 6. Get services for tenant (final output for UI)
 // ✅ خدمات المستأجر النهائية بعد التعديل
-app.get('/api/services-for-tenant/:tenantUserId', verifyToken, (req, res) => {
+app.get('/api/services-for-tenant/:tenantUserId', verifyToken, async (req, res) => {
   const tenantUserId = req.params.tenantUserId;
 
-  const getAdminQuery = `
+  const getAdminSql = `
     SELECT rcd.admin_id
     FROM rental_contracts_details rcd
     JOIN users u ON rcd.tenant_id = u.id
@@ -1632,59 +1774,55 @@ app.get('/api/services-for-tenant/:tenantUserId', verifyToken, (req, res) => {
     LIMIT 1
   `;
 
-  db.query(getAdminQuery, [tenantUserId], (adminErr, adminResults) => {
-    if (adminErr) return res.status(500).json({ message: 'DB Error', error: adminErr });
+  const servicesSql = `
+    SELECT ds.*
+    FROM dynamic_services ds
+    LEFT JOIN admin_service_visibility v ON v.service_id = ds.id AND v.admin_id = ?
+    WHERE ds.is_active = 1 AND (
+      (ds.is_default = 1 AND (v.is_enabled IS NULL OR v.is_enabled = 1))
+      OR (ds.is_default = 0 AND v.is_enabled = 1)
+    )
+    ORDER BY ds.display_order ASC
+  `;
 
-    if (!adminResults.length) return res.status(404).json({ message: 'المالك غير موجود' });
+  try {
+    const adminResults = await query(getAdminSql, [tenantUserId]);
+
+    if (adminResults.length === 0) {
+      return res.status(404).json({ message: 'المالك غير موجود' });
+    }
 
     const adminId = adminResults[0].admin_id;
+    const results = await query(servicesSql, [adminId]);
 
-    const servicesQuery = `
-  SELECT ds.*
-  FROM dynamic_services ds
-  LEFT JOIN admin_service_visibility v ON v.service_id = ds.id AND v.admin_id = ?
-  WHERE ds.is_active = 1 AND (
-    (ds.is_default = 1 AND (v.is_enabled IS NULL OR v.is_enabled = 1))
-    OR (ds.is_default = 0 AND v.is_enabled = 1)
-  )
-  ORDER BY ds.display_order ASC
-`;
+    const services = results.map(service => {
+      let route;
+      switch (service.id) {
+        case 1: route = 'internetService'; break;
+        case 2: route = 'apartmentSecurity'; break;
+        case 3: route = 'cleaningService'; break;
+        case 4: route = 'urgentMaintenance'; break;
+        case 5: route = 'reportProblem'; break;
+        case 6: route = 'downloadContract'; break;
+        case 7: route = 'waterDelivery'; break;
+        case 8: route = 'paymentAlert'; break;
+        case 9: route = 'supportContact'; break;
+        case 21: route = 'cleaningServiceRequest'; break;       
+        case 22: route = 'changeLocksRequest'; break;           
+        case 23: route = 'noiseComplaintRequest'; break;        
+        case 24: route = 'apartmentSuppliesRequest'; break;     
+        default: route = null;
+      }
 
-    db.query(servicesQuery, [adminId], (err, results) => {
-      if (err) return res.status(500).json({ message: 'DB Error', err });
-
-     // داخل الكود الحالي للـ API، عدّل:
-const services = results.map(service => {
-  let route;
-  switch (service.id) {
-  case 1: route = 'internetService'; break;
-  case 2: route = 'apartmentSecurity'; break;
-  case 3: route = 'cleaningService'; break;
-  case 4: route = 'urgentMaintenance'; break;
-  case 5: route = 'reportProblem'; break;
-  case 6: route = 'downloadContract'; break;
-  case 7: route = 'waterDelivery'; break;
-  case 8: route = 'paymentAlert'; break;
-  case 9: route = 'supportContact'; break;
-  case 21: route = 'cleaningServiceRequest'; break;        // 🧹 طلب خدمة تنظيف متخصصة
-  case 22: route = 'changeLocksRequest'; break;            // 🔐 طلب تغيير الأقفال
-  case 23: route = 'noiseComplaintRequest'; break;         // 🚨 بلاغ إزعاج
-  case 24: route = 'apartmentSuppliesRequest'; break;      // 📦 طلب مستلزمات الشقة
-  default: route = null;
-}
-
-
-  return {
-    ...service,
-    route: route
-  };
-});
-
-
-
-      res.json({ services });
+      return { ...service, route };
     });
-  });
+
+    res.json({ services });
+
+  } catch (err) {
+    console.error('❌ Services-for-tenant Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
 });
 
 
@@ -1692,7 +1830,7 @@ const services = results.map(service => {
 
 
 
-app.put('/api/services/:id/order', verifyToken, (req, res) => {
+app.put('/api/services/:id/order', verifyToken, async (req, res) => {
   const { userType } = req.user;
   const serviceId = req.params.id;
   const { display_order } = req.body;
@@ -1705,17 +1843,22 @@ app.put('/api/services/:id/order', verifyToken, (req, res) => {
     return res.status(400).json({ message: '❗ display_order مطلوب ويجب أن يكون رقمًا صالحًا' });
   }
 
-  const query = 'UPDATE dynamic_services SET display_order = ? WHERE id = ?';
+  const sql = `
+    UPDATE dynamic_services 
+    SET display_order = ? 
+    WHERE id = ?
+  `;
 
-  db.query(query, [display_order, serviceId], (err) => {
-    if (err) {
-      console.error('❌ DB Error:', err);
-      return res.status(500).json({ message: 'فشل في تحديث الترتيب' });
-    }
-
+  try {
+    await query(sql, [display_order, serviceId]);
     res.json({ message: '✅ تم تحديث ترتيب الخدمة بنجاح' });
-  });
+
+  } catch (err) {
+    console.error('❌ Update-service-order Error:', err);
+    res.status(500).json({ message: 'فشل في تحديث الترتيب' });
+  }
 });
+
 
 
 
@@ -1729,28 +1872,38 @@ app.post('/api/noise-complaints', verifyToken, async (req, res) => {
     return res.status(403).json({ message: '❌ فقط المستأجر يمكنه تقديم بلاغ' });
   }
 
+  const getAdminSql = `
+    SELECT admin_id FROM rental_contracts_details 
+    WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1
+  `;
+
+  const insertComplaintSql = `
+    INSERT INTO noise_complaints (tenant_id, admin_id, category, description) 
+    VALUES (?, ?, ?, ?)
+  `;
+
   try {
-    // جلب admin_id من آخر عقد للمستأجر
-    const [[row]] = await db.promise().query(
-      `SELECT admin_id FROM rental_contracts_details 
-       WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1`,
-      [userId]
-    );
+    const adminRows = await query(getAdminSql, [userId]);
 
-    if (!row) return res.status(404).json({ message: 'لا يوجد عقد مرتبط' });
+    if (adminRows.length === 0) {
+      return res.status(404).json({ message: 'لا يوجد عقد مرتبط' });
+    }
 
-    await db.promise().query(
-      `INSERT INTO noise_complaints (tenant_id, admin_id, category, description) 
-       VALUES (?, ?, ?, ?)`,
-      [userId, row.admin_id, category, description || '']
-    );
+    await query(insertComplaintSql, [
+      userId,
+      adminRows[0].admin_id,
+      category,
+      description || '',
+    ]);
 
     res.json({ message: '✅ تم إرسال البلاغ بنجاح' });
+
   } catch (err) {
-    console.error(err);
+    console.error('❌ Noise-complaint-create Error:', err);
     res.status(500).json({ message: '❌ خطأ في إرسال البلاغ' });
   }
 });
+
 
 
 app.get('/api/noise-complaints/tenant', verifyToken, async (req, res) => {
@@ -1760,16 +1913,17 @@ app.get('/api/noise-complaints/tenant', verifyToken, async (req, res) => {
     return res.status(403).json({ message: '❌ فقط المستأجر يملك هذه الصلاحية' });
   }
 
-  try {
-    const [complaints] = await db.promise().query(
-      `SELECT id, category, description, status, created_at
-       FROM noise_complaints WHERE tenant_id = ? ORDER BY created_at DESC`,
-      [userId]
-    );
+  const sql = `
+    SELECT id, category, description, status, created_at
+    FROM noise_complaints WHERE tenant_id = ? ORDER BY created_at DESC
+  `;
 
+  try {
+    const complaints = await query(sql, [userId]);
     res.json({ complaints });
+
   } catch (err) {
-    console.error(err);
+    console.error('❌ Noise-complaints-tenant Error:', err);
     res.status(500).json({ message: '❌ خطأ في جلب البلاغات' });
   }
 });
@@ -1782,19 +1936,21 @@ app.get('/api/noise-complaints/admin', verifyToken, async (req, res) => {
     return res.status(403).json({ message: '❌ فقط المالك يمكنه عرض هذه البلاغات' });
   }
 
-  try {
-    const [complaints] = await db.promise().query(
-      `SELECT id, category, description, status, created_at
-       FROM noise_complaints WHERE admin_id = ? ORDER BY created_at DESC`,
-      [adminId]
-    );
+  const sql = `
+    SELECT id, category, description, status, created_at
+    FROM noise_complaints WHERE admin_id = ? ORDER BY created_at DESC
+  `;
 
+  try {
+    const complaints = await query(sql, [adminId]);
     res.json({ complaints });
+
   } catch (err) {
-    console.error(err);
+    console.error('❌ Noise-complaints-admin Error:', err);
     res.status(500).json({ message: '❌ خطأ في جلب البلاغات' });
   }
 });
+
 
 app.put('/api/noise-complaints/:id/status', verifyToken, async (req, res) => {
   const { userType } = req.user;
@@ -1809,18 +1965,20 @@ app.put('/api/noise-complaints/:id/status', verifyToken, async (req, res) => {
     return res.status(400).json({ message: '❗ حالة غير صالحة' });
   }
 
-  try {
-    await db.promise().query(
-      `UPDATE noise_complaints SET status = ? WHERE id = ?`,
-      [status, complaintId]
-    );
+  const sql = `
+    UPDATE noise_complaints SET status = ? WHERE id = ?
+  `;
 
+  try {
+    await query(sql, [status, complaintId]);
     res.json({ message: '✅ تم تحديث حالة البلاغ' });
+
   } catch (err) {
-    console.error(err);
+    console.error('❌ Update-complaint-status Error:', err);
     res.status(500).json({ message: '❌ فشل في التحديث' });
   }
 });
+
 
 
 app.delete('/api/noise-complaints/:id', verifyToken, async (req, res) => {
@@ -1831,14 +1989,16 @@ app.delete('/api/noise-complaints/:id', verifyToken, async (req, res) => {
     return res.status(403).json({ message: '❌ فقط السوبر يمكنه الحذف' });
   }
 
+  const sql = `
+    DELETE FROM noise_complaints WHERE id = ?
+  `;
+
   try {
-    await db.promise().query(
-      `DELETE FROM noise_complaints WHERE id = ?`,
-      [id]
-    );
+    await query(sql, [id]);
     res.json({ message: '🗑️ تم حذف البلاغ بنجاح' });
+
   } catch (err) {
-    console.error(err);
+    console.error('❌ Delete-complaint Error:', err);
     res.status(500).json({ message: '❌ خطأ أثناء الحذف' });
   }
 });
@@ -1850,15 +2010,18 @@ app.get('/api/noise-complaints/:id', verifyToken, async (req, res) => {
   const { userType, id: userId } = req.user;
   const complaintId = req.params.id;
 
-  try {
-    const [[complaint]] = await db.promise().query(
-      `SELECT * FROM noise_complaints WHERE id = ?`,
-      [complaintId]
-    );
+  const sql = `
+    SELECT * FROM noise_complaints WHERE id = ?
+  `;
 
-    if (!complaint) {
+  try {
+    const complaints = await query(sql, [complaintId]);
+
+    if (complaints.length === 0) {
       return res.status(404).json({ message: 'البلاغ غير موجود' });
     }
+
+    const complaint = complaints[0];
 
     if (userType === 'user' && complaint.tenant_id !== userId) {
       return res.status(403).json({ message: '❌ لا تملك صلاحية الوصول لهذا البلاغ' });
@@ -1869,12 +2032,12 @@ app.get('/api/noise-complaints/:id', verifyToken, async (req, res) => {
     }
 
     res.json({ complaint });
+
   } catch (err) {
-    console.error(err);
+    console.error('❌ Get-complaint Error:', err);
     res.status(500).json({ message: '❌ خطأ في جلب البلاغ' });
   }
 });
-
 
 
 
@@ -1882,25 +2045,26 @@ app.get('/api/noise-complaints/:id', verifyToken, async (req, res) => {
 app.get('/api/payment-alert', verifyToken, async (req, res) => {
   const userId = req.user.id;
 
-  try {
-    const [[existing]] = await db.promise().query(
-      'SELECT is_enabled, days_before FROM payment_alert_settings WHERE user_id = ?',
-      [userId]
-    );
+  const selectSql = `
+    SELECT is_enabled, days_before FROM payment_alert_settings WHERE user_id = ?
+  `;
+  const insertSql = `
+    INSERT INTO payment_alert_settings (user_id) VALUES (?)
+  `;
 
-    if (existing) {
-      return res.json({ ...existing });
+  try {
+    const existingRows = await query(selectSql, [userId]);
+
+    if (existingRows.length) {
+      return res.json({ ...existingRows[0] });
     }
 
-    // لا يوجد إعداد سابق، إنشاء افتراضي
-    await db.promise().query(
-      'INSERT INTO payment_alert_settings (user_id) VALUES (?)',
-      [userId]
-    );
+    await query(insertSql, [userId]);
 
-    return res.json({ is_enabled: true, days_before: 3 });
+    res.json({ is_enabled: true, days_before: 3 });
+
   } catch (err) {
-    console.error('❌ Error fetching payment alert settings:', err);
+    console.error('❌ Get-payment-alert Error:', err);
     res.status(500).json({ message: 'خطأ في جلب الإعدادات' });
   }
 });
@@ -1914,17 +2078,18 @@ app.put('/api/payment-alert', verifyToken, async (req, res) => {
     return res.status(400).json({ message: '❗ البيانات غير صالحة' });
   }
 
-  try {
-    await db.promise().query(
-      `INSERT INTO payment_alert_settings (user_id, is_enabled, days_before)
-       VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE is_enabled = VALUES(is_enabled), days_before = VALUES(days_before)`,
-      [userId, is_enabled, days_before]
-    );
+  const sql = `
+    INSERT INTO payment_alert_settings (user_id, is_enabled, days_before)
+    VALUES (?, ?, ?)
+    ON DUPLICATE KEY UPDATE is_enabled = VALUES(is_enabled), days_before = VALUES(days_before)
+  `;
 
+  try {
+    await query(sql, [userId, is_enabled, days_before]);
     res.json({ message: '✅ تم حفظ الإعدادات بنجاح' });
+
   } catch (err) {
-    console.error('❌ Error updating payment alert settings:', err);
+    console.error('❌ Update-payment-alert Error:', err);
     res.status(500).json({ message: 'فشل في تحديث الإعدادات' });
   }
 });
@@ -1938,33 +2103,34 @@ app.get('/api/payment-alert/:targetUserId', verifyToken, async (req, res) => {
     return res.status(403).json({ message: '❌ لا تملك صلاحية الوصول' });
   }
 
+  const getUserSql = 'SELECT id FROM users WHERE user_id = ? LIMIT 1';
+  const selectSql = 'SELECT is_enabled, days_before FROM payment_alert_settings WHERE user_id = ?';
+  const insertSql = 'INSERT INTO payment_alert_settings (user_id) VALUES (?)';
+
   try {
-    const [[userRow]] = await db.promise().query(
-      'SELECT id FROM users WHERE user_id = ? LIMIT 1',
-      [targetUserId]
-    );
-    if (!userRow) return res.status(404).json({ message: 'المستخدم غير موجود' });
-
-    const [[existing]] = await db.promise().query(
-      'SELECT is_enabled, days_before FROM payment_alert_settings WHERE user_id = ?',
-      [userRow.id]
-    );
-
-    if (existing) {
-      return res.json({ ...existing });
+    const userRows = await query(getUserSql, [targetUserId]);
+    if (userRows.length === 0) {
+      return res.status(404).json({ message: 'المستخدم غير موجود' });
     }
 
-    await db.promise().query(
-      'INSERT INTO payment_alert_settings (user_id) VALUES (?)',
-      [userRow.id]
-    );
+    const userRow = userRows[0];
 
-    return res.json({ is_enabled: true, days_before: 3 });
+    const existingRows = await query(selectSql, [userRow.id]);
+
+    if (existingRows.length) {
+      return res.json({ ...existingRows[0] });
+    }
+
+    await query(insertSql, [userRow.id]);
+
+    res.json({ is_enabled: true, days_before: 3 });
+
   } catch (err) {
-    console.error(err);
+    console.error('❌ Get-user-payment-alert Error:', err);
     res.status(500).json({ message: '❌ خطأ في جلب الإعدادات' });
   }
 });
+
 
 
 app.put('/api/payment-alert/:targetUserId', verifyToken, async (req, res) => {
@@ -1980,26 +2146,468 @@ app.put('/api/payment-alert/:targetUserId', verifyToken, async (req, res) => {
     return res.status(400).json({ message: '❗ البيانات غير صالحة' });
   }
 
+  const getUserSql = 'SELECT id FROM users WHERE user_id = ? LIMIT 1';
+
+  const updateSql = `
+    INSERT INTO payment_alert_settings (user_id, is_enabled, days_before)
+    VALUES (?, ?, ?)
+    ON DUPLICATE KEY UPDATE is_enabled = VALUES(is_enabled), days_before = VALUES(days_before)
+  `;
+
   try {
-    const [[userRow]] = await db.promise().query(
-      'SELECT id FROM users WHERE user_id = ? LIMIT 1',
-      [targetUserId]
-    );
-    if (!userRow) return res.status(404).json({ message: 'المستخدم غير موجود' });
+    const userRows = await query(getUserSql, [targetUserId]);
+    if (userRows.length === 0) {
+      return res.status(404).json({ message: 'المستخدم غير موجود' });
+    }
 
-    await db.promise().query(
-      `INSERT INTO payment_alert_settings (user_id, is_enabled, days_before)
-       VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE is_enabled = VALUES(is_enabled), days_before = VALUES(days_before)`,
-      [userRow.id, is_enabled, days_before]
-    );
+    const userRow = userRows[0];
 
+    await query(updateSql, [userRow.id, is_enabled, days_before]);
     res.json({ message: '✅ تم تحديث إعدادات المستخدم' });
+
   } catch (err) {
-    console.error(err);
+    console.error('❌ Update-user-payment-alert Error:', err);
     res.status(500).json({ message: '❌ فشل في تحديث الإعدادات' });
   }
 });
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// جلب جميع المستأجرين للمالك الحالي
+app.get('/api/admin-tenants/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      tenant_id, tenant_name, contract_number, contract_start, contract_end, contract_type,
+      tenant_phone, tenant_email, tenant_address
+    FROM rental_contracts_details
+    WHERE admin_id = ?
+    ORDER BY created_at DESC
+  `;
+
+  try {
+    const tenants = await query(sql, [adminId]);
+    res.json({ tenants });
+
+  } catch (err) {
+    console.error('❌ Admin-tenants-fetch Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+app.get('/api/admin-tenants/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      tenant_id, tenant_name, contract_number, contract_start, contract_end, contract_type,
+      tenant_phone, tenant_email, tenant_address
+    FROM rental_contracts_details
+    WHERE admin_id = ?
+    ORDER BY created_at DESC
+  `;
+
+  try {
+    const tenants = await query(sql, [adminId]);
+    res.json({ tenants });
+
+  } catch (err) {
+    console.error('❌ Admin-tenants-fetch Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.get('/api/admin-finance-summary/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const contractsSumSql = `
+    SELECT 
+      IFNULL(SUM(total_contract_value), 0) AS total_contracts,
+      COUNT(*) AS contracts_count
+    FROM rental_contracts_details
+    WHERE admin_id = ?
+  `;
+
+  const paymentsSumSql = `
+    SELECT 
+      IFNULL(SUM(p.payment_amount), 0) AS total_paid
+    FROM payments p
+    JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+    WHERE rcd.admin_id = ? AND p.payment_status = 'مدفوعة'
+  `;
+
+  try {
+    const contractsRows = await query(contractsSumSql, [adminId]);
+    const paymentsRows = await query(paymentsSumSql, [adminId]);
+
+    const total_contracts = contractsRows[0].total_contracts;
+    const contracts_count = contractsRows[0].contracts_count;
+    const total_paid = paymentsRows[0].total_paid;
+    const total_remaining = total_contracts - total_paid;
+
+    res.json({
+      total_contracts,
+      total_paid,
+      total_remaining,
+      contracts_count,
+    });
+
+  } catch (err) {
+    console.error('❌ Admin-finance-summary Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.get('/api/admin-finance-monthly/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      DATE_FORMAT(date_range.month, '%Y-%m') AS month,
+      IFNULL(SUM(rcd.periodic_rent_payment), 0) AS monthly_expected_income,
+      COUNT(rcd.id) AS contracts_count
+    FROM (
+      SELECT CURDATE() - INTERVAL (a.a + (10 * b.a)) MONTH AS month
+      FROM (SELECT 0 AS a UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) AS a
+      CROSS JOIN (SELECT 0 AS a UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) AS b
+    ) AS date_range
+    JOIN rental_contracts_details rcd 
+      ON rcd.admin_id = ? 
+      AND date_range.month BETWEEN DATE_FORMAT(rcd.contract_start, '%Y-%m-01') AND DATE_FORMAT(rcd.contract_end, '%Y-%m-01')
+    GROUP BY month
+    ORDER BY month DESC
+  `;
+
+  try {
+    const monthly = await query(sql, [adminId]);
+    res.json({ monthly });
+
+  } catch (err) {
+    console.error('❌ Admin-finance-monthly Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.get('/api/admin-finance-yearly/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      years.year AS year,
+      IFNULL(SUM(rcd.periodic_rent_payment) * 12, 0) AS yearly_expected_income,
+      COUNT(DISTINCT rcd.id) AS contracts_count
+    FROM (
+      SELECT YEAR(CURDATE()) AS year
+      UNION SELECT YEAR(CURDATE()) - 1
+      UNION SELECT YEAR(CURDATE()) - 2
+      UNION SELECT YEAR(CURDATE()) - 3
+      UNION SELECT YEAR(CURDATE()) - 4
+    ) AS years
+    JOIN rental_contracts_details rcd 
+      ON rcd.admin_id = ?
+      AND (
+        YEAR(rcd.contract_start) <= years.year 
+        AND YEAR(rcd.contract_end) >= years.year
+      )
+    GROUP BY years.year
+    ORDER BY years.year DESC
+  `;
+
+  try {
+    const yearly = await query(sql, [adminId]);
+    res.json({ yearly });
+
+  } catch (err) {
+    console.error('❌ Admin-finance-yearly Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.get('/api/admin-contracts-finance/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      rcd.contract_number,
+      rcd.tenant_name,
+      rcd.total_contract_value,
+      IFNULL(SUM(p.payment_amount), 0) AS paid,
+      (rcd.total_contract_value - IFNULL(SUM(p.payment_amount), 0)) AS remaining
+    FROM rental_contracts_details rcd
+    LEFT JOIN payments p ON p.contract_id = rcd.id AND p.payment_status = 'مدفوعة'
+    WHERE rcd.admin_id = ?
+    GROUP BY rcd.id
+    ORDER BY rcd.contract_start DESC
+  `;
+
+  try {
+    const contracts = await query(sql, [adminId]);
+    res.json({ contracts });
+
+  } catch (err) {
+    console.error('❌ Admin-contracts-finance Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.get('/api/admin-expiring-contracts/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      contract_number, tenant_name, contract_end
+    FROM rental_contracts_details
+    WHERE admin_id = ? 
+      AND contract_end >= CURDATE() 
+      AND contract_end <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)
+    ORDER BY contract_end ASC
+  `;
+
+  try {
+    const expiring = await query(sql, [adminId]);
+    res.json({ expiring });
+
+  } catch (err) {
+    console.error('❌ Admin-expiring-contracts Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+
+
+app.get('/api/admin-arrears/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      p.payment_number, p.payment_amount, p.due_date, p.payment_status,
+      rcd.contract_number, rcd.tenant_name
+    FROM payments p
+    JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+    WHERE rcd.admin_id = ? AND p.payment_status != 'مدفوعة' AND p.due_date < CURDATE()
+    ORDER BY p.due_date ASC
+  `;
+
+  try {
+    const arrears = await query(sql, [adminId]);
+    res.json({ arrears });
+
+  } catch (err) {
+    console.error('❌ Admin-arrears Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.get('/api/admin-contracts-growth/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      month,
+      count,
+      count - IFNULL(LAG(count) OVER (ORDER BY month), 0) AS growth
+    FROM (
+      SELECT DATE_FORMAT(created_at, '%Y-%m') AS month,
+             COUNT(*) AS count
+      FROM rental_contracts_details
+      WHERE admin_id = ?
+      GROUP BY month
+    ) monthly_counts
+    ORDER BY month DESC
+    LIMIT 12
+  `;
+
+  try {
+    const rows = await query(sql, [adminId]);
+    res.json({ monthly_contracts_growth: rows });
+
+  } catch (err) {
+    console.error('❌ Admin-contracts-growth Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.get('/api/admin-finance-6months/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT
+      CONCAT(years.year, '-', LPAD(periods.start_month, 2, '0'), ' ~ ', LPAD(periods.end_month, 2, '0')) AS period,
+      IFNULL(SUM(rcd.periodic_rent_payment) * 6, 0) AS six_months_expected_income,
+      COUNT(DISTINCT rcd.id) AS contracts_count
+    FROM (
+      SELECT YEAR(CURDATE()) AS year UNION SELECT YEAR(CURDATE()) - 1
+    ) AS years
+    CROSS JOIN (
+      SELECT 1 AS start_month, 6 AS end_month UNION ALL
+      SELECT 7 AS start_month, 12 AS end_month
+    ) AS periods
+    JOIN rental_contracts_details rcd ON rcd.admin_id = ?
+      AND (
+        DATE(rcd.contract_start) <= LAST_DAY(CONCAT(years.year, '-', periods.end_month, '-01'))
+        AND DATE(rcd.contract_end) >= DATE(CONCAT(years.year, '-', periods.start_month, '-01'))
+      )
+    GROUP BY years.year, periods.start_month
+    ORDER BY years.year DESC, periods.start_month DESC
+  `;
+
+  try {
+    const rows = await query(sql, [adminId]);
+    res.json({ six_months: rows });
+
+  } catch (err) {
+    console.error('❌ Admin-finance-6months Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+app.get('/api/admin-collection-rate/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      (
+        (SELECT IFNULL(SUM(p.payment_amount),0) FROM payments p
+         JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+         WHERE rcd.admin_id = ? AND p.payment_status = 'مدفوعة')
+        /
+        (SELECT IFNULL(SUM(total_contract_value),0) FROM rental_contracts_details WHERE admin_id = ?)
+      ) * 100 AS collection_rate
+  `;
+
+  try {
+    const rows = await query(sql, [adminId, adminId]);
+    res.json({ collection_rate: rows[0].collection_rate || 0 });
+
+  } catch (err) {
+    console.error('❌ Admin-collection-rate Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.get('/api/admin-finance-period/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+  const { from, to } = req.query;
+
+  const sql = `
+    SELECT 
+      IFNULL(SUM(p.payment_amount), 0) AS paid_sum
+    FROM payments p
+    JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+    WHERE rcd.admin_id = ? 
+      AND p.payment_status = 'مدفوعة' 
+      AND p.paid_date BETWEEN ? AND ?
+  `;
+
+  try {
+    const rows = await query(sql, [adminId, from, to]);
+    res.json({ paid_sum: rows[0].paid_sum || 0 });
+
+  } catch (err) {
+    console.error('❌ Admin-finance-period Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+app.get('/api/admin-properties-stats/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      property_units_count AS units_count,
+      COUNT(*) AS properties_count
+    FROM rental_contracts_details
+    WHERE admin_id = ?
+    GROUP BY property_units_count
+    ORDER BY property_units_count ASC
+  `;
+
+  try {
+    const rows = await query(sql, [adminId]);
+    res.json({ properties_stats: rows });
+
+  } catch (err) {
+    console.error('❌ Admin-properties-stats Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+app.post('/api/renew-contract', upload.single('pdf'), async (req, res) => {
+  const contractId = req.body.contractId;
+
+  const archiveSql = `
+    INSERT INTO contracts_archive (
+      contract_id, contract_number, contract_type, contract_date, contract_start, contract_end,
+      contract_location, owner_name, owner_nationality, owner_id_type, owner_id_number, owner_email,
+      owner_phone, owner_address, tenant_name, tenant_nationality, tenant_id_type, tenant_id_number,
+      tenant_email, tenant_phone, tenant_address, property_national_address, property_building_type,
+      property_usage, property_units_count, property_floors_count, unit_type, unit_number, unit_floor_number,
+      unit_area, unit_furnishing_status, unit_ac_units_count, unit_ac_type, annual_rent,
+      periodic_rent_payment, rent_payment_cycle, rent_payments_count, total_contract_value,
+      terms_conditions, privacy_policy, pdf_path, tenant_id, admin_id, property_id, tenant_serial_number
+    )
+    SELECT
+      id, contract_number, contract_type, contract_date, contract_start, contract_end,
+      contract_location, owner_name, owner_nationality, owner_id_type, owner_id_number, owner_email,
+      owner_phone, owner_address, tenant_name, tenant_nationality, tenant_id_type, tenant_id_number,
+      tenant_email, tenant_phone, tenant_address, property_national_address, property_building_type,
+      property_usage, property_units_count, property_floors_count, unit_type, unit_number, unit_floor_number,
+      unit_area, unit_furnishing_status, unit_ac_units_count, unit_ac_type, annual_rent,
+      periodic_rent_payment, rent_payment_cycle, rent_payments_count, total_contract_value,
+      terms_conditions, privacy_policy, pdf_path, tenant_id, admin_id, property_id, tenant_serial_number
+    FROM rental_contracts_details
+    WHERE id = ?
+  `;
+
+  const updateSql = `
+    UPDATE rental_contracts_details
+    SET contract_start = ?, contract_end = ?, pdf_path = ?
+    WHERE id = ?
+  `;
+
+  try {
+    await query(archiveSql, [contractId]);
+
+    await query(updateSql, [
+      req.body.contract_start,
+      req.body.contract_end,
+      '/uploads/' + req.file.filename,
+      contractId
+    ]);
+
+    res.json({ message: 'تم تجديد العقد بنجاح وأرشفة القديم.' });
+
+  } catch (err) {
+    console.error('❌ Renew-contract Error:', err);
+    res.status(500).json({ message: 'خطأ في تجديد العقد', error: err });
+  }
+});
+
+
+
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
