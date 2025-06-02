@@ -558,15 +558,19 @@ admin_id: req.body.adminId,
 };
 
 
-   const insertQuery = `INSERT INTO rental_contracts_details SET ?`;
+  const fields = Object.keys(data).join(', ');
+const values = Object.values(data);
+const placeholders = Object.keys(data).map(() => '?').join(', ');
 
-    let contractResult;
-    try {
-      contractResult = await query(insertQuery, data);
-    } catch (err) {
-      console.error('❌ DB Error:', err);
-      return res.status(500).json({ message: 'فشل في حفظ بيانات العقد' });
-    }
+const insertQuery = `INSERT INTO rental_contracts_details (${fields}) VALUES (${placeholders})`;
+
+let contractResult;
+try {
+  contractResult = await query(insertQuery, values);
+} catch (err) {
+  console.error('❌ DB Error:', err);
+  return res.status(500).json({ message: 'فشل في حفظ بيانات العقد' });
+}
 
     const contractId = contractResult.insertId;
     const tenantId = data.tenant_id;
@@ -621,12 +625,13 @@ admin_id: req.body.adminId,
       }
 
       const paymentsQuery = `
-        INSERT INTO payments (contract_id, payment_number, payment_amount, due_date, payment_status)
-        VALUES ?
-      `;
+  INSERT INTO payments (contract_id, payment_number, payment_amount, due_date, payment_status)
+  VALUES ${payments.map(() => '(?,?,?,?,?)').join(',')}
+`;
 
       try {
-        await query(paymentsQuery, [payments]);
+        const flatPayments = payments.flat();
+        await query(paymentsQuery, flatPayments);
       } catch (paymentsErr) {
         console.error('❌ Payments DB Error:', paymentsErr);
         return res.status(500).json({ message: 'تم حفظ العقد، لكن فشل في إنشاء الدفعات' });
@@ -654,10 +659,13 @@ admin_id: req.body.adminId,
           created_at: new Date(),
         };
 
-        const subscriptionQuery = 'INSERT INTO rental_contracts SET ?';
+        const fields = Object.keys(subscriptionData).join(', ');
+const values = Object.values(subscriptionData);
+const placeholders = Object.keys(subscriptionData).map(() => '?').join(', ');
+const subscriptionQuery = `INSERT INTO rental_contracts (${fields}) VALUES (${placeholders})`;
 
         try {
-          await query(subscriptionQuery, subscriptionData);
+          await query(subscriptionQuery, values);
           res.json({
             message: '✅ تم تحليل وتخزين العقد وإنشاء الاشتراك بنجاح',
             contract_number: data.contract_number
