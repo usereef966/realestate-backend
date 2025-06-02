@@ -124,6 +124,7 @@ function sendLoginSuccess(res, user) {
       userId: user.user_id,
       name: user.name,
       userType: user.user_type,
+      id: user.id // أضف id هنا لتسهيل الوصول إليه في المستقبل
     },
   });
 }
