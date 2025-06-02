@@ -221,10 +221,10 @@ app.post('/api/get-admin-details', verifyToken, async (req, res) => {
   const { userId } = req.body;
 
   const sql = `
-    SELECT u.user_id, u.name, u.email, u.user_type
+    SELECT u.user_id, u.name, u.user_type
     FROM users u
     INNER JOIN admin_subscriptions s ON u.id = s.admin_id
-    WHERE u.user_id = ?;
+    WHERE u.id = ?;
   `;
 
   try {
