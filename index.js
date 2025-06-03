@@ -1200,7 +1200,7 @@ app.get('/api/admin-active-chats/:userId', verifyToken, async (req, res) => {
 // 📁 index.js أو ملف routes المناسب
 // 📁 index.js أو ملف routes المناسب
 const { JWT } = require('google-auth-library');
-const serviceAccount = require('./firebase/firebase-service-account.json');
+const serviceAccount = JSON.parse(process.env.GOOGLE_CREDENTIALS);
 
 // دالة لجلب التوكن من Google
 async function getAccessToken() {
