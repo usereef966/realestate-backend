@@ -403,6 +403,7 @@ app.post('/api/create-tenant', verifyToken, async (req, res) => {
 const pdfParse = require('pdf-parse');
 const fs = require('fs');
 const path = require('path');
+
 const multer = require('multer');
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, 'uploads/'),
@@ -411,7 +412,6 @@ const storage = multer.diskStorage({
     cb(null, uniqueName);
   }
 });
-
 const upload = multer({ storage });
 
 // ... الإعدادات السابقة كما هي
@@ -421,18 +421,23 @@ app.post('/api/analyze-local-pdf', upload.single('pdf'), async (req, res) => {
   console.log("File saved at:", req.file.path);
 
 
+  const user_id = req.body.tenantId;
+  const admin_id = req.user?.id || req.body.adminId; // حسب كيف بتمرر الادمن
+  let createdTenant = false;
+  let createdToken = false;
+  let tenantDbId, token;
+
   try {
     const fileBuffer = fs.readFileSync(req.file.path);
     const pdfData = await pdfParse(fileBuffer);
     const text = pdfData.text;
-    
+
     const cleanText = (txt) =>
       txt.replace(/[^\p{L}\p{N}\s,.-]/gu, '').replace(/\s+/g, ' ').trim();
 
     const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
     const toFloat = (v) => parseFloat(v) || 0;
     const toInt = (v) => parseInt(v) || 0;
-
 
     
 
@@ -553,24 +558,92 @@ const data = {
   })(),
 
   pdf_path: '/' + req.file.path.replace(/\\/g, '/'),
-tenant_id: req.body.tenantId,
-admin_id: req.body.adminId,
-};
+      tenant_id: null, // بنعبيها بعدين
+      admin_id: admin_id
+    };
+
+    // === 1. تحقق/أنشئ المستأجر والتوكن ===
+    const userCheckSql = 'SELECT id FROM users WHERE user_id = ? LIMIT 1';
+    const tenant_name_from_pdf = data.tenant_name || '---';
+    try {
+      const existing = await query(userCheckSql, [user_id]);
+      if (existing.length === 0) {
+        token = crypto.randomBytes(32).toString('hex');
+        const insertUserSql = `
+          INSERT INTO users (user_id, name, user_type, token, created_at, created_by)
+          VALUES (?, ?, 'user', ?, NOW(), ?)
+        `;
+        const userResult = await query(insertUserSql, [
+          user_id,
+          tenant_name_from_pdf,
+          token,
+          admin_id
+        ]);
+        tenantDbId = userResult.insertId;
+        createdTenant = true;
+
+        const insertTokenSql = `
+          INSERT INTO user_tokens (token, permissions, created_by)
+          VALUES (?, ?, ?)
+        `;
+        await query(insertTokenSql, [token, '{}', admin_id]);
+        createdToken = true;
+      } else {
+        tenantDbId = existing[0].id;
+        // تحديث الاسم من PDF لو فاضي
+        await query('UPDATE users SET name = ? WHERE id = ?', [tenant_name_from_pdf, tenantDbId]);
+      }
+    } catch (err) {
+      console.error('❌ User Creation Error:', err);
+      return res.status(500).json({ message: 'فشل في إنشاء أو التحقق من المستأجر' });
+    }
+    data.tenant_id = tenantDbId;
 
 
-  const fields = Object.keys(data).join(', ');
-const values = Object.values(data);
-const placeholders = Object.keys(data).map(() => '?').join(', ');
+    
 
-const insertQuery = `INSERT INTO rental_contracts_details (${fields}) VALUES (${placeholders})`;
+    // === 2. إدخال بيانات العقد وكامل العملية بنفس المنطق ===
 
-let contractResult;
-try {
-  contractResult = await query(insertQuery, values);
-} catch (err) {
-  console.error('❌ DB Error:', err);
-  return res.status(500).json({ message: 'فشل في حفظ بيانات العقد' });
+
+    // --- ابدأ من هنا (Property ID logic) ---
+let property_id;
+const [existingProperty] = await query(`
+  SELECT property_id FROM properties
+  WHERE property_national_address = ? AND admin_id = ?
+  LIMIT 1
+`, [data.property_national_address, admin_id]);
+
+if (existingProperty) {
+  property_id = existingProperty.property_id;
+} else {
+  const insertResult = await query(`
+    INSERT INTO properties (property_national_address, property_units_count, admin_id)
+    VALUES (?, ?, ?)
+  `, [data.property_national_address, data.property_units_count, admin_id]);
+  
+  property_id = insertResult.insertId;
 }
+
+// هنا تضيف property_id في البيانات
+data.property_id = property_id;
+
+
+    const fields = Object.keys(data).join(', ');
+    const values = Object.values(data);
+    const placeholders = Object.keys(data).map(() => '?').join(', ');
+
+// --- انتهى الجزء الخاص بالـ Property ID ---
+
+
+    const insertQuery = `INSERT INTO rental_contracts_details (${fields}) VALUES (${placeholders})`;
+
+    let contractResult;
+    try {
+      contractResult = await query(insertQuery, values);
+    } catch (err) {
+      console.error('❌ DB Error:', err);
+      return res.status(500).json({ message: 'فشل في حفظ بيانات العقد' });
+    }
 
     const contractId = contractResult.insertId;
     const tenantId = data.tenant_id;
@@ -625,9 +698,9 @@ try {
       }
 
       const paymentsQuery = `
-  INSERT INTO payments (contract_id, payment_number, payment_amount, due_date, payment_status)
-  VALUES ${payments.map(() => '(?,?,?,?,?)').join(',')}
-`;
+        INSERT INTO payments (contract_id, payment_number, payment_amount, due_date, payment_status)
+        VALUES ${payments.map(() => '(?,?,?,?,?)').join(',')}
+      `;
 
       try {
         const flatPayments = payments.flat();
@@ -660,24 +733,48 @@ try {
         };
 
         const fields = Object.keys(subscriptionData).join(', ');
-const values = Object.values(subscriptionData);
-const placeholders = Object.keys(subscriptionData).map(() => '?').join(', ');
-const subscriptionQuery = `INSERT INTO rental_contracts (${fields}) VALUES (${placeholders})`;
+        const values = Object.values(subscriptionData);
+        const placeholders = Object.keys(subscriptionData).map(() => '?').join(', ');
+        const subscriptionQuery = `INSERT INTO rental_contracts (${fields}) VALUES (${placeholders})`;
 
         try {
           await query(subscriptionQuery, values);
-          res.json({
-            message: '✅ تم تحليل وتخزين العقد وإنشاء الاشتراك بنجاح',
-            contract_number: data.contract_number
+          return res.json({
+            message: '✅ تم رفع وتحليل الـPDF وإنشاء المستأجر والعقد وكافة العمليات بنجاح',
+            tenant: {
+              created: createdTenant,
+              name: tenant_name_from_pdf,
+              user_id: user_id,
+              db_id: tenantDbId,
+              token: token || null,
+            },
+            contract_id: contractId,
+            contract_number: data.contract_number,
+            payments: paymentsCount,
+            chat_room: true,
+            subscription: 'created',
+            property_id: data.property_id
           });
         } catch (insertSubErr) {
           console.error('❌ Subscription DB Error:', insertSubErr);
           return res.status(500).json({ message: 'تم حفظ العقد لكن فشل في إنشاء الاشتراك' });
         }
       } else {
-        res.json({
-          message: '✅ تم تحليل وتخزين العقد وتحديث الاشتراك بنجاح',
-          contract_number: data.contract_number
+        return res.json({
+          message: '✅ تم رفع وتحليل الـPDF وإنشاء المستأجر وتحديث العقد وكافة العمليات بنجاح',
+          tenant: {
+            created: createdTenant,
+            name: tenant_name_from_pdf,
+            user_id: user_id,
+            db_id: tenantDbId,
+            token: token || null,
+          },
+          contract_id: contractId,
+          contract_number: data.contract_number,
+          payments: paymentsCount,
+          chat_room: true,
+          subscription: 'updated',
+          property_id: data.property_id
         });
       }
     };
@@ -982,7 +1079,7 @@ app.get('/api/messages/:chatRoomId', verifyToken, async (req, res) => {
   const { chatRoomId } = req.params;
   const userId = req.user.userId;
 
-  console.log('القيم التي يتم التحقق منها:', { chatRoomId, userId });
+ 
 
   const checkSql = `
     SELECT * FROM chat_rooms 
@@ -1058,6 +1155,44 @@ app.get('/api/chat-room/tenant/:tenantId', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'خطأ في جلب بيانات غرفة الدردشة' });
   }
 });
+
+// ✅ API جديدة لجلب غرف الدردشة النشطة للمستأجرين
+app.get('/api/admin-active-chats/:userId', verifyToken, async (req, res) => {
+  const { userId } = req.params;
+
+  const sql = `
+    SELECT 
+      rcd.tenant_id, 
+      u.user_id AS tenant_user_id, 
+      rcd.tenant_name, 
+      rcd.contract_number, 
+      cr.id AS chatRoomId,
+      (
+        SELECT COUNT(*) FROM messages m
+        WHERE m.chat_room_id = cr.id AND m.receiver_id = ?
+        AND m.is_read = 0
+      ) AS unread_count
+    FROM rental_contracts_details rcd
+    INNER JOIN rental_contracts rc ON rc.tenant_id = rcd.tenant_id AND rc.status = 'active'
+    INNER JOIN chat_rooms cr ON cr.contract_id = rcd.id
+    INNER JOIN users u ON u.id = rcd.tenant_id
+    INNER JOIN users admin ON admin.id = rcd.admin_id
+    WHERE admin.user_id = ? -- ✅ هنا أصبحنا نستخدم user_id النصي
+    ORDER BY rcd.created_at DESC
+  `;
+
+  try {
+    const chats = await query(sql, [userId, userId]);
+    res.status(200).json({ chats });
+  } catch (err) {
+    console.error('❌ Admin-active-chats Error:', err);
+    res.status(500).json({ message: 'خطأ في جلب غرف الدردشة النشطة' });
+  }
+});
+
+
+
+
 
 
 
@@ -2546,11 +2681,11 @@ app.get('/api/admin-properties-stats/:adminId', verifyToken, async (req, res) =>
   const sql = `
     SELECT 
       property_units_count AS units_count,
-      COUNT(*) AS properties_count
+      COUNT(DISTINCT property_id) AS properties_count
     FROM rental_contracts_details
     WHERE admin_id = ?
     GROUP BY property_units_count
-    ORDER BY property_units_count ASC
+    ORDER BY property_units_count ASC;
   `;
 
   try {
@@ -2566,52 +2701,265 @@ app.get('/api/admin-properties-stats/:adminId', verifyToken, async (req, res) =>
 
 app.post('/api/renew-contract', upload.single('pdf'), async (req, res) => {
   const contractId = req.body.contractId;
+  const admin_id = req.user?.id || req.body.adminId;
 
-  const archiveSql = `
-    INSERT INTO contracts_archive (
-      contract_id, contract_number, contract_type, contract_date, contract_start, contract_end,
-      contract_location, owner_name, owner_nationality, owner_id_type, owner_id_number, owner_email,
-      owner_phone, owner_address, tenant_name, tenant_nationality, tenant_id_type, tenant_id_number,
-      tenant_email, tenant_phone, tenant_address, property_national_address, property_building_type,
-      property_usage, property_units_count, property_floors_count, unit_type, unit_number, unit_floor_number,
-      unit_area, unit_furnishing_status, unit_ac_units_count, unit_ac_type, annual_rent,
-      periodic_rent_payment, rent_payment_cycle, rent_payments_count, total_contract_value,
-      terms_conditions, privacy_policy, pdf_path, tenant_id, admin_id, property_id, tenant_serial_number
-    )
-    SELECT
-      id, contract_number, contract_type, contract_date, contract_start, contract_end,
-      contract_location, owner_name, owner_nationality, owner_id_type, owner_id_number, owner_email,
-      owner_phone, owner_address, tenant_name, tenant_nationality, tenant_id_type, tenant_id_number,
-      tenant_email, tenant_phone, tenant_address, property_national_address, property_building_type,
-      property_usage, property_units_count, property_floors_count, unit_type, unit_number, unit_floor_number,
-      unit_area, unit_furnishing_status, unit_ac_units_count, unit_ac_type, annual_rent,
-      periodic_rent_payment, rent_payment_cycle, rent_payments_count, total_contract_value,
-      terms_conditions, privacy_policy, pdf_path, tenant_id, admin_id, property_id, tenant_serial_number
-    FROM rental_contracts_details
-    WHERE id = ?
-  `;
-
-  const updateSql = `
-    UPDATE rental_contracts_details
-    SET contract_start = ?, contract_end = ?, pdf_path = ?
-    WHERE id = ?
-  `;
+  if (!req.file) {
+    return res.status(400).json({ message: 'يجب رفع ملف PDF جديد لتجديد العقد' });
+  }
 
   try {
+    const fileBuffer = fs.readFileSync(req.file.path);
+    const pdfData = await pdfParse(fileBuffer);
+    const text = pdfData.text;
+
+    const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
+    const toFloat = (v) => parseFloat(v) || 0;
+    const toInt = (v) => parseInt(v) || 0;
+
+    const data = {
+  contract_number: extract(/Contract No\.(.+?):العقد سجل رقم/),
+  contract_type: extract(/Contract Type(.+?):العقد نوع/),
+  contract_date: extract(/Contract Sealing Date(\d{4}-\d{2}-\d{2})/),
+  contract_start: extract(/Tenancy Start Date(\d{4}-\d{2}-\d{2})/),
+  contract_end: extract(/Tenancy End Date(\d{4}-\d{2}-\d{2})/),
+  contract_location: extract(/Location\n(.+?):العقد إبرام مكان/),
+
+  // Tenant Information
+  tenant_name: (() => {
+    let raw = '';
+    let match = text.match(/Name\s*الاسم:?\s*(.+)/);
+    if (match && match[1]) {
+      raw = match[1].trim();
+    } else {
+      match = text.match(/Tenant Data[\s\S]*?Name(.+?):الاسم/);
+      if (match && match[1]) raw = match[1].trim();
+    }
+    return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
+  })(),
+
+  tenant_nationality: extract(/Tenant Data[\s\S]*?Nationality(.+?):الجنسي/),
+  tenant_id_type: (() => {
+    const raw = extract(/Tenant Data[\s\S]*?ID Type(.+?):الهوي/).trim();
+    return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
+  })(),
+  tenant_id_number: extract(/Tenant Data[\s\S]*?ID No\.(\d+):الهوي/),
+  tenant_email: extract(/Tenant Data[\s\S]*?Email(.+?):الإلكتروني البريد/) || '-',
+  tenant_phone: extract(/Tenant Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
+  tenant_address: (() => {
+    const raw = extract(/Tenant Data[\s\S]*?National Address(.+?):الوطني العنوان/).trim();
+    if (!raw) return '';
+    const parts = raw.split(/,\s*/);
+    return parts.map(part => part.split(/\s+/).reverse().join(' ')).reverse().join(', ');
+  })(),
+
+  // Owner Information
+  owner_name: extract(/Lessor Data[\s\S]*?Name(.+?):الاسم/).split(' ').reverse().join(' '),
+  owner_nationality: (() => {
+    const lines = text.split('\n');
+    const i = lines.findIndex(line => line.includes('Nationality'));
+    if (i !== -1 && lines[i + 1] && lines[i + 2]) {
+      const raw = `${lines[i + 1].trim()} ${lines[i + 2].trim()}`;
+      const words = raw.split(/\s+/);
+      if (words.includes('السعودية') && words.includes('العربية') && words.includes('المملكة')) {
+        return 'المملكة العربية السعودية';
+      }
+      return raw;
+    }
+    return (i !== -1 && lines[i + 1]) ? lines[i + 1].trim() : '';
+  })(),
+  owner_id_type: (() => {
+    const lines = text.split('\n');
+    const idx = lines.findIndex(line => line.includes('ID Type'));
+    let result = '';
+    if (idx !== -1) {
+      const line = lines[idx];
+      const match = line.match(/ID Type\s*([^\:]+):الهوي/);
+      if (match && match[1]) result = match[1].trim();
+      else {
+        const start = line.indexOf('ID Type') + 'ID Type'.length;
+        const end = line.indexOf(':الهوي');
+        if (end > start) result = line.substring(start, end).trim();
+      }
+    }
+    if (result) {
+      const words = result.split(/\s+/);
+      if (words.length === 2 && (words[0].endsWith('ية') || words[0].endsWith('يم'))) {
+        return `${words[1]} ${words[0]}`;
+      }
+    }
+    return result;
+  })(),
+  owner_id_number: extract(/Lessor Data[\s\S]*?ID No\.(\d+):الهوي/),
+  owner_email: extract(/Lessor Data[\s\S]*?Email(.+?):الإلكتروني البريد/),
+  owner_phone: extract(/Lessor Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
+  owner_address: (() => {
+    let addr = '';
+    const match = text.match(/National Address\s*:?([^\n:]+):الوطني العنوان/);
+    if (match && match[1]) addr = match[1].replace(/\s+/g, ' ').trim();
+    else {
+      const alt = text.match(/العنوان الوطني:\s*([^\n:]+)\s*Address National/);
+      if (alt && alt[1]) addr = alt[1].replace(/\s+/g, ' ').trim();
+    }
+    return addr.split(/\s+/).reverse().join(' ');
+  })(),
+
+  // Financial Data
+  annual_rent: toFloat(extract(/Annual Rent\s*(\d+\.\d+)/)),
+  periodic_rent_payment: toFloat(extract(/Regular Rent Payment:\s*(\d+\.\d+)/)),
+  rent_payment_cycle: extract(/Rent payment cycle\s*(\S+)/).replace(/الايجار.*/, '').trim(),
+  rent_payments_count: toInt(extract(/Number of Rent\s*Payments:\s*(\d+)/)),
+  total_contract_value: toFloat(extract(/Total Contract value\s*(\d+\.\d+)/)),
+
+  // Property Information
+  property_usage: (() => {
+    const raw = extract(/Property Usage\s*(.+?)\s*استخدام/).trim();
+    return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
+  })(),
+  property_building_type: extract(/Property Type(.+?):العقار بناء نوع/),
+  property_units_count: toInt(extract(/Number of Units(\d+)/)),
+  property_floors_count: toInt(extract(/Number of Floors(\d+)/)),
+  property_national_address: extract(/Property Data[\s\S]*?National Address(.+?):الوطني العنوان/),
+
+  // Unit Information
+  unit_type: extract(/Unit Type(.+?):الوحدة نوع/),
+  unit_number: extract(/Unit No\.(.+?):الوحدة رقم/),
+  unit_floor_number: toInt(extract(/Floor No\.(\d+):الطابق رقم/)),
+  unit_area: toFloat(extract(/Unit Area(\d+\.\d+):الوحدة مساحة/)),
+  unit_furnishing_status: extract(/Furnishing Status\s*[-:]?\s*(.*?)\s*Number of AC units/),
+  unit_ac_units_count: toInt(extract(/Number of AC units(\d+)/)),
+  unit_ac_type: (() => {
+    const raw = extract(/AC Type(.+?)التكييف نوع/).trim();
+    return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
+  })(),
+
+  pdf_path: '/' + req.file.path.replace(/\\/g, '/'),
+      tenant_id: null, // بنعبيها بعدين
+      admin_id: admin_id
+    };
+
+
+    // تحقق من وجود العقار أو أنشئه
+    let property_id;
+    const [existingProperty] = await query(`
+      SELECT property_id FROM properties
+      WHERE property_national_address = ? AND admin_id = ?
+      LIMIT 1
+    `, [data.property_national_address, admin_id]);
+
+    if (existingProperty) {
+      property_id = existingProperty.property_id;
+    } else {
+      const insertResult = await query(`
+        INSERT INTO properties (property_national_address, property_units_count, admin_id)
+        VALUES (?, ?, ?)
+      `, [data.property_national_address, data.property_units_count, admin_id]);
+
+      property_id = insertResult.insertId;
+    }
+
+    data.property_id = property_id;
+
+    // أرشفة العقد القديم
+    const archiveSql = `
+      INSERT INTO contracts_archive (
+        contract_id, contract_number, contract_type, contract_date, contract_start, contract_end,
+        contract_location, owner_name, owner_nationality, owner_id_type, owner_id_number, owner_email,
+        owner_phone, owner_address, tenant_name, tenant_nationality, tenant_id_type, tenant_id_number,
+        tenant_email, tenant_phone, tenant_address, property_national_address, property_building_type,
+        property_usage, property_units_count, property_floors_count, unit_type, unit_number, unit_floor_number,
+        unit_area, unit_furnishing_status, unit_ac_units_count, unit_ac_type, annual_rent,
+        periodic_rent_payment, rent_payment_cycle, rent_payments_count, total_contract_value,
+        terms_conditions, privacy_policy, pdf_path, tenant_id, admin_id, property_id, tenant_serial_number, archived_at
+      )
+      SELECT
+        id, contract_number, contract_type, contract_date, contract_start, contract_end,
+        contract_location, owner_name, owner_nationality, owner_id_type, owner_id_number, owner_email,
+        owner_phone, owner_address, tenant_name, tenant_nationality, tenant_id_type, tenant_id_number,
+        tenant_email, tenant_phone, tenant_address, property_national_address, property_building_type,
+        property_usage, property_units_count, property_floors_count, unit_type, unit_number, unit_floor_number,
+        unit_area, unit_furnishing_status, unit_ac_units_count, unit_ac_type, annual_rent,
+        periodic_rent_payment, rent_payment_cycle, rent_payments_count, total_contract_value,
+        terms_conditions, privacy_policy, pdf_path, tenant_id, admin_id, property_id, tenant_serial_number, NOW()
+      FROM rental_contracts_details
+      WHERE id = ?
+    `;
+
+
+    const [existingContract] = await query(`
+  SELECT tenant_id FROM rental_contracts_details WHERE id = ?
+`, [contractId]);
+
+if (!existingContract || !existingContract.tenant_id) {
+  return res.status(400).json({ message: 'لم يتم العثور على معرف المستأجر للعقد القديم.' });
+}
+
+data.tenant_id = existingContract.tenant_id;
+
     await query(archiveSql, [contractId]);
 
-    await query(updateSql, [
-      req.body.contract_start,
-      req.body.contract_end,
-      '/uploads/' + req.file.filename,
-      contractId
-    ]);
+    // تحديث العقد الجديد
+ const updateFields = Object.keys(data)
+  .filter(key => key !== 'tenant_id') // مستبعد tenant_id
+  .map(key => `${key}=?`).join(', ');
 
-    res.json({ message: 'تم تجديد العقد بنجاح وأرشفة القديم.' });
+const updateValues = Object.keys(data)
+  .filter(key => key !== 'tenant_id')
+  .map(key => data[key]);
+
+updateValues.push(contractId);  // إضافة شرط الـ WHERE في نهاية المصفوفة
+
+const updateSql = `
+  UPDATE rental_contracts_details SET ${updateFields} WHERE id=?
+`;
+
+await query(updateSql, updateValues);
+
+    res.json({
+      message: '✅ تم تجديد العقد بنجاح وأرشفة النسخة القديمة.',
+      contract_id: contractId,
+      property_id: property_id,
+      contract_start: data.contract_start,
+      contract_end: data.contract_end
+    });
 
   } catch (err) {
     console.error('❌ Renew-contract Error:', err);
     res.status(500).json({ message: 'خطأ في تجديد العقد', error: err });
+  }
+});
+
+
+
+app.get('/api/check-username/:username', verifyToken, async (req, res) => {
+  const { username } = req.params;
+
+  const sql = 'SELECT COUNT(*) AS count FROM users WHERE user_id = ?';
+  try {
+    const [result] = await query(sql, [username]);
+    res.json({ exists: result.count > 0 });
+  } catch (err) {
+    console.error('Error checking username:', err);
+    res.status(500).json({ message: 'DB Error' });
+  }
+});
+
+
+app.get('/api/tenants-expiring/:adminId', verifyToken, async (req, res) => {
+  const adminId = req.params.adminId;
+
+  const sql = `
+    SELECT id, tenant_name, unit_number, contract_end, contract_number
+    FROM rental_contracts_details
+    WHERE admin_id = ?
+      AND (contract_end <= CURDATE() OR contract_end BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 30 DAY))
+    ORDER BY contract_end ASC
+  `;
+
+  try {
+    const tenants = await query(sql, [adminId]);
+    res.json({ tenants });
+  } catch (err) {
+    res.status(500).json({ error: err });
   }
 });
 
