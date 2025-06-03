@@ -400,25 +400,20 @@ app.post('/api/create-tenant', verifyToken, async (req, res) => {
   }
 });
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-const pdfParse = require('pdf-parse');
+const multer = require('multer');
+const { Storage } = require('@google-cloud/storage');
+const path = require('path');
+const os = require('os');
 const fs = require('fs');
 
+const upload = multer({ dest: os.tmpdir() }); // التخزين المؤقت
 
-const multer = require('multer');
-const MulterGoogleStorage = require('multer-google-storage');
-const path = require('path');
-
-const upload = multer({
-  storage: new MulterGoogleStorage({
-    bucket: 'rental-contracts-pdfs',
-    projectId: JSON.parse(process.env.GOOGLE_CLOUD_KEY_JSON).project_id,
-    credentials: JSON.parse(process.env.GOOGLE_CLOUD_KEY_JSON),
-    filename: (req, file, cb) => {
-      const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1E9)}.pdf`;
-      cb(null, uniqueName);
-    }
-  })
+const storage = new Storage({
+  credentials: JSON.parse(process.env.GOOGLE_CLOUD_KEY_JSON),
+  projectId: JSON.parse(process.env.GOOGLE_CLOUD_KEY_JSON).project_id,
 });
+const bucket = storage.bucket('rental-contracts-pdfs'); // اسم الباكِت تبعك
+
 
 
 // ... الإعدادات السابقة كما هي
@@ -435,16 +430,23 @@ app.post('/api/analyze-local-pdf', upload.single('pdf'), async (req, res) => {
   let tenantDbId, token;
 
   try {
-    const fileBuffer = fs.readFileSync(req.file.path);
-    const pdfData = await pdfParse(fileBuffer);
-    const text = pdfData.text;
+   const tempPath = req.file.path;
+const gcsFileName = `${Date.now()}-${req.file.originalname}`;
 
-    const cleanText = (txt) =>
-      txt.replace(/[^\p{L}\p{N}\s,.-]/gu, '').replace(/\s+/g, ' ').trim();
+await bucket.upload(tempPath, {
+  destination: gcsFileName,
+  resumable: false,
+  contentType: req.file.mimetype,
+  metadata: {
+    cacheControl: 'public, max-age=31536000',
+  },
+});
 
-    const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
-    const toFloat = (v) => parseFloat(v) || 0;
-    const toInt = (v) => parseInt(v) || 0;
+const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
+const pdfData = await pdfParse(fileBuffer);   // ⬅️ تحليل الملف
+const text = pdfData.text;                    // ⬅️ النص اللي راح تستخدمه
+
 
     
 
@@ -564,7 +566,7 @@ const data = {
     return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
   })(),
 
-  pdf_path: '/' + req.file.path.replace(/\\/g, '/'),
+  pdf_path: publicUrl,
       tenant_id: null, // بنعبيها بعدين
       admin_id: admin_id
     };
@@ -2715,13 +2717,22 @@ app.post('/api/renew-contract', upload.single('pdf'), async (req, res) => {
   }
 
   try {
-    const fileBuffer = fs.readFileSync(req.file.path);
-    const pdfData = await pdfParse(fileBuffer);
-    const text = pdfData.text;
+    const tempPath = req.file.path;
+const gcsFileName = `${Date.now()}-${req.file.originalname}`;
 
-    const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
-    const toFloat = (v) => parseFloat(v) || 0;
-    const toInt = (v) => parseInt(v) || 0;
+await bucket.upload(tempPath, {
+  destination: gcsFileName,
+  resumable: false,
+  contentType: req.file.mimetype,
+  metadata: {
+    cacheControl: 'public, max-age=31536000',
+  },
+});
+
+const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
+const pdfData = await pdfParse(fileBuffer);   // ⬅️ تحليل الملف
+const text = pdfData.text;                    // ⬅️ النص اللي راح تستخدمه
 
     const data = {
   contract_number: extract(/Contract No\.(.+?):العقد سجل رقم/),
