@@ -446,6 +446,9 @@ const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`
 const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
 const pdfData = await pdfParse(fileBuffer);   // ⬅️ تحليل الملف
 const text = pdfData.text;                    // ⬅️ النص اللي راح تستخدمه
+console.log('📄 Temp Path:', tempPath);
+console.log('📄 File Exists:', fs.existsSync(tempPath));
+console.log('📄 File Size:', fs.statSync(tempPath).size);
 
 
     
@@ -806,9 +809,12 @@ data.property_id = property_id;
       }
     }
   } catch (err) {
-    console.error('❌ PDF Analyze Error:', err);
-    res.status(500).json({ message: 'فشل في تحليل الـ PDF' });
-  }
+  console.error('❌ PDF Analyze Error:', err.stack || err.message || err);
+  res.status(500).json({
+    message: 'فشل في تحليل الـ PDF',
+    error: err.message || err.toString(),
+  });
+}
 });
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 app.get('/api/profile/contract/:userId', verifyToken, async (req, res) => {
