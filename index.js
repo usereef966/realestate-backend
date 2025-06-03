@@ -2839,7 +2839,7 @@ app.post('/api/renew-contract', upload.single('pdf'), async (req, res) => {
     return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
   })(),
 
-  pdf_path: '/' + req.file.path.replace(/\\/g, '/'),
+  pdf_path: `https://storage.googleapis.com/rental-contracts-pdfs/${req.file.filename}`,
       tenant_id: null, // بنعبيها بعدين
       admin_id: admin_id
     };
