@@ -2613,25 +2613,25 @@ app.get('/api/admin-finance-6months/:adminId', verifyToken, async (req, res) => 
   const { adminId } = req.params;
 
   const sql = `
-    SELECT
-      CONCAT(years.year, '-', LPAD(periods.start_month, 2, '0'), ' ~ ', LPAD(periods.end_month, 2, '0')) AS period,
-      IFNULL(SUM(rcd.periodic_rent_payment) * 6, 0) AS six_months_expected_income,
-      COUNT(DISTINCT rcd.id) AS contracts_count
-    FROM (
-      SELECT YEAR(CURDATE()) AS year UNION SELECT YEAR(CURDATE()) - 1
-    ) AS years
-    CROSS JOIN (
-      SELECT 1 AS start_month, 6 AS end_month UNION ALL
-      SELECT 7 AS start_month, 12 AS end_month
-    ) AS periods
-    JOIN rental_contracts_details rcd ON rcd.admin_id = ?
-      AND (
-        DATE(rcd.contract_start) <= LAST_DAY(CONCAT(years.year, '-', periods.end_month, '-01'))
-        AND DATE(rcd.contract_end) >= DATE(CONCAT(years.year, '-', periods.start_month, '-01'))
-      )
-    GROUP BY years.year, periods.start_month
-    ORDER BY years.year DESC, periods.start_month DESC
-  `;
+  SELECT
+    CONCAT(years.year, '-', LPAD(periods.start_month, 2, '0'), ' ~ ', LPAD(periods.end_month, 2, '0')) AS period,
+    IFNULL(SUM(rcd.periodic_rent_payment) * 6, 0) AS six_months_expected_income,
+    COUNT(DISTINCT rcd.id) AS contracts_count
+  FROM (
+    SELECT YEAR(CURDATE()) AS year UNION SELECT YEAR(CURDATE()) - 1
+  ) AS years
+  CROSS JOIN (
+    SELECT 1 AS start_month, 6 AS end_month UNION ALL
+    SELECT 7 AS start_month, 12 AS end_month
+  ) AS periods
+  JOIN rental_contracts_details rcd ON rcd.admin_id = ?
+    AND (
+      DATE(rcd.contract_start) <= LAST_DAY(CONCAT(years.year, '-', periods.end_month, '-01'))
+      AND DATE(rcd.contract_end) >= DATE(CONCAT(years.year, '-', periods.start_month, '-01'))
+    )
+  GROUP BY years.year, periods.start_month, periods.end_month
+  ORDER BY years.year DESC, periods.start_month DESC
+`;
 
   try {
     const rows = await query(sql, [adminId]);
