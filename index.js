@@ -411,7 +411,7 @@ const path = require('path');
 const upload = multer({
   storage: new MulterGoogleStorage({
     bucket: 'rental-contracts-pdfs',
-    projectId: process.env.GOOGLE_CLOUD_PROJECT_ID,
+    projectId: JSON.parse(process.env.GOOGLE_CLOUD_KEY_JSON).project_id,
     credentials: JSON.parse(process.env.GOOGLE_CLOUD_KEY_JSON),
     filename: (req, file, cb) => {
       const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1E9)}.pdf`;
