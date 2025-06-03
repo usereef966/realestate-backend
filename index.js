@@ -3,6 +3,8 @@ const mysql = require('mysql2');
 const cors = require('cors');
 require('dotenv').config();
 const fetch = require('node-fetch');
+const pdfParse = require('pdf-parse');
+
 
 
 
@@ -446,6 +448,9 @@ const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`
 const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
 const pdfData = await pdfParse(fileBuffer);   // ⬅️ تحليل الملف
 const text = pdfData.text;                    // ⬅️ النص اللي راح تستخدمه
+const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
+const toFloat = (v) => parseFloat(v) || 0;
+const toInt = (v) => parseInt(v) || 0;
 console.log('📄 Temp Path:', tempPath);
 console.log('📄 File Exists:', fs.existsSync(tempPath));
 console.log('📄 File Size:', fs.statSync(tempPath).size);
@@ -2739,6 +2744,14 @@ const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`
 const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
 const pdfData = await pdfParse(fileBuffer);   // ⬅️ تحليل الملف
 const text = pdfData.text;                    // ⬅️ النص اللي راح تستخدمه
+const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
+const toFloat = (v) => parseFloat(v) || 0;
+const toInt = (v) => parseInt(v) || 0;
+console.log('📄 Temp Path:', tempPath);
+console.log('📄 File Exists:', fs.existsSync(tempPath));
+console.log('📄 File Size:', fs.statSync(tempPath).size);
+
+
 
     const data = {
   contract_number: extract(/Contract No\.(.+?):العقد سجل رقم/),
@@ -2856,7 +2869,7 @@ const text = pdfData.text;                    // ⬅️ النص اللي راح
     return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
   })(),
 
-  pdf_path: `https://storage.googleapis.com/rental-contracts-pdfs/${req.file.filename}`,
+  pdf_path: publicUrl,
       tenant_id: null, // بنعبيها بعدين
       admin_id: admin_id
     };
