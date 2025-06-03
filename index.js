@@ -405,14 +405,21 @@ const fs = require('fs');
 const path = require('path');
 
 const multer = require('multer');
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
-  filename: (req, file, cb) => {
-    const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1E9)}.pdf`;
-    cb(null, uniqueName);
-  }
+const MulterGoogleStorage = require('multer-google-storage');
+const path = require('path');
+
+const upload = multer({
+  storage: new MulterGoogleStorage({
+    bucket: 'rental-contracts-pdfs',
+    projectId: process.env.GOOGLE_CLOUD_PROJECT_ID,
+    credentials: JSON.parse(process.env.GOOGLE_CLOUD_KEY_JSON),
+    filename: (req, file, cb) => {
+      const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1E9)}.pdf`;
+      cb(null, uniqueName);
+    }
+  })
 });
-const upload = multer({ storage });
+
 
 // ... الإعدادات السابقة كما هي
 
