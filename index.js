@@ -1617,12 +1617,12 @@ app.get('/api/property-tenants/:cleanedAddress/:adminId', verifyToken, async (re
   const sql = `
     SELECT 
       u.user_id AS tenant_id,
-      rcd.tenant_name,
-      rcd.tenant_phone,
-      rcd.tenant_email,
-      rcd.unit_number,
-      rcd.unit_floor_number,
-      rcd.unit_area
+      MAX(rcd.tenant_name) AS tenant_name,
+      MAX(rcd.tenant_phone) AS tenant_phone,
+      MAX(rcd.tenant_email) AS tenant_email,
+      MAX(rcd.unit_number) AS unit_number,
+      MAX(rcd.unit_floor_number) AS unit_floor_number,
+      MAX(rcd.unit_area) AS unit_area
     FROM rental_contracts_details rcd
     JOIN users u ON u.id = rcd.tenant_id
     WHERE rcd.admin_id = ?
@@ -1640,6 +1640,7 @@ app.get('/api/property-tenants/:cleanedAddress/:adminId', verifyToken, async (re
     res.status(500).json({ message: 'DB Error', error: err });
   }
 });
+
 
 
 app.get('/api/tenants-by-admin/:adminId', verifyToken, async (req, res) => {
