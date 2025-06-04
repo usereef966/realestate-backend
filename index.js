@@ -1648,15 +1648,15 @@ app.get('/api/tenants-by-admin/:adminId', verifyToken, async (req, res) => {
   const sql = `
     SELECT 
       u.user_id AS tenant_id,
-      rcd.tenant_name,
-      rcd.tenant_phone
+      MAX(rcd.tenant_name) AS tenant_name,
+      MAX(rcd.tenant_phone) AS tenant_phone
     FROM rental_contracts_details rcd
     JOIN users u ON u.id = rcd.tenant_id
     WHERE rcd.admin_id = ?
       AND u.fcm_token IS NOT NULL
       AND u.fcm_token != ''
     GROUP BY u.user_id
-    ORDER BY rcd.tenant_name ASC;
+    ORDER BY tenant_name ASC;
   `;
 
   try {
@@ -1667,6 +1667,7 @@ app.get('/api/tenants-by-admin/:adminId', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'DB Error', error: err });
   }
 });
+
 
 
 // ✅ endpoint لإظهار الإشعارات التي أرسلها المالك للمستأجرين
