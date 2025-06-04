@@ -215,7 +215,41 @@ app.post('/api/validate-user', verifyToken, async (req, res) => {
 });
 
 
+app.put('/api/admin/update-name', verifyToken, async (req, res) => {
+  const { userType, id: adminId } = req.user;
+  const { name } = req.body;
 
+  if (userType !== 'admin' && userType !== 'super') {
+    return res.status(403).json({ message: '❌ فقط المالك أو السوبر يمكنه تعديل الاسم' });
+  }
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({ message: '❗ الاسم الجديد مطلوب' });
+  }
+
+  try {
+    await query('UPDATE users SET name = ? WHERE id = ?', [name.trim(), adminId]);
+    res.json({ message: '✅ تم تحديث اسم المالك بنجاح' });
+  } catch (err) {
+    console.error('❌ Update-admin-name Error:', err);
+    res.status(500).json({ message: 'فشل في تحديث الاسم', error: err });
+  }
+});
+
+
+
+app.get('/api/admin-token-count/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+  try {
+    const [row] = await query(
+      'SELECT COUNT(*) AS count FROM admin_tokens WHERE created_by = ?',
+      [adminId]
+    );
+    res.json({ count: row.count });
+  } catch (err) {
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
 
 
 
@@ -265,6 +299,19 @@ app.post('/api/get-user-details', verifyToken, async (req, res) => {
   } catch (err) {
     console.error('❌ Get-user-details Error:', err);
     res.status(500).json({ message: 'خطأ داخلي في الخادم' });
+  }
+});
+
+
+app.get('/api/admin-token/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+  const sql = 'SELECT token FROM users WHERE id = ?';
+  try {
+    const [row] = await query(sql, [adminId]);
+    if (!row) return res.status(404).json({ message: 'المالك غير موجود' });
+    res.json({ token: row.token });
+  } catch (err) {
+    res.status(500).json({ message: 'DB Error', error: err });
   }
 });
 
@@ -1213,6 +1260,72 @@ app.get('/api/admin-active-chats/:userId', verifyToken, async (req, res) => {
 
 
 
+app.post('/api/chat/send-notification', verifyToken, async (req, res) => {
+  const { receiverId, title, body, chatRoomId, senderId } = req.body;
+
+  if (!receiverId || !title || !body || !chatRoomId || !senderId) {
+    return res.status(400).json({ message: '❗ جميع الحقول مطلوبة' });
+  }
+
+  try {
+    // جلب FCM Token للمستلم
+    const [receiver] = await query('SELECT fcm_token FROM users WHERE user_id = ?', [receiverId]);
+    if (!receiver || !receiver.fcm_token) {
+      console.warn('🚫 لا يوجد FCM Token للمستلم:', receiverId);
+      return res.status(404).json({ message: '❌ لا يوجد FCM Token للمستلم' });
+    }
+
+    const accessToken = await getAccessToken();
+    const fcmMessage = {
+      message: {
+        token: receiver.fcm_token,
+        notification: { title, body },
+        data: {
+          screen: 'chat',
+          chatRoomId: String(chatRoomId),
+          senderId: String(senderId),
+        }
+      }
+    };
+
+    // اطبع الـpayload قبل الإرسال
+    console.log('🚀 سيتم إرسال إشعار FCM بهذا الشكل:');
+    console.log(JSON.stringify(fcmMessage, null, 2));
+
+    // أرسل الإشعار
+    const response = await fetch(
+      `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(fcmMessage),
+      }
+    );
+
+    // اطبع رد FCM
+    const responseBody = await response.text();
+    console.log('🔥 رد FCM:', responseBody);
+
+    if (!response.ok) {
+      console.error('❌ خطأ من FCM:', response.status, responseBody);
+      return res.status(500).json({ message: 'فشل في إرسال إشعار الشات', fcmError: responseBody });
+    }
+
+    res.json({ message: '✅ تم إرسال إشعار الشات بنجاح', fcmPayload: fcmMessage, fcmResponse: responseBody });
+
+  } catch (err) {
+    console.error('❌ Chat-notification Error:', err);
+    res.status(500).json({ message: 'فشل في إرسال إشعار الشات', error: err.message });
+  }
+});
+
+
+
+
+
 
 
 
@@ -1280,14 +1393,19 @@ app.post('/api/send-notification', verifyToken, async (req, res) => {
 
   const accessToken = await getAccessToken();
 
-  for (const { token, userId } of tokens) {
-    const message = {
-      message: {
-        token,
-        notification: { title, body },
-        data: { screen: 'notifications', userId }
+for (const { token, userId } of tokens) {
+  const message = {
+    message: {
+      token,
+      notification: { title, body },
+      data: {
+        screen: 'notifications',
+        userId,
+        userType: targetType || 'user', // ← يعتمد على targetType المُرسل من الواجهة
+        senderType: 'super' // إضافة هذه المعلومة
       }
-    };
+    }
+  };
 
     try {
       await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
@@ -1313,7 +1431,6 @@ app.post('/api/send-notification', verifyToken, async (req, res) => {
 
   res.json({ message: `✅ تم إرسال الإشعار إلى ${tokens.length} مستخدم` });
 });
-
 
 
 
@@ -1384,13 +1501,23 @@ app.post('/api/activate-subscription', verifyToken, async (req, res) => {
     return res.status(400).json({ message: 'يجب إرسال adminId و startDate و endDate' });
   }
 
-  const sql = `
-    INSERT INTO admin_subscriptions (admin_id, start_date, end_date)
-    VALUES (?, ?, ?)
-    ON DUPLICATE KEY UPDATE start_date = VALUES(start_date), end_date = VALUES(end_date)
-  `;
-
   try {
+    // تحقق أولًا من صلاحية الاشتراك الحالي
+    const checkSql = `
+      SELECT end_date FROM admin_subscriptions WHERE admin_id = ?
+    `;
+    const rows = await query(checkSql, [adminId]);
+
+    if (rows.length > 0 && new Date(rows[0].end_date) >= new Date()) {
+      return res.status(400).json({ message: '⚠️ الاشتراك الحالي ما زال فعّالًا ولا يحتاج لتحديث.' });
+    }
+
+    const sql = `
+      INSERT INTO admin_subscriptions (admin_id, start_date, end_date)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE start_date = VALUES(start_date), end_date = VALUES(end_date)
+    `;
+
     await query(sql, [adminId, startDate, endDate]);
     res.json({ message: '✅ تم تفعيل أو تحديث الاشتراك للمُـلك' });
 
@@ -1399,6 +1526,39 @@ app.post('/api/activate-subscription', verifyToken, async (req, res) => {
     res.status(500).json({ message: '❌ فشل في تفعيل الاشتراك' });
   }
 });
+
+
+// ✅ التحقق من صلاحية اشتراك المالك
+app.get('/api/check-admin-subscription/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT end_date
+    FROM admin_subscriptions
+    WHERE admin_id = ?
+  `;
+
+  try {
+    const rows = await query(sql, [adminId]);
+    if (rows.length === 0) {
+      return res.json({ isSubscribed: false });
+    }
+
+    const endDate = new Date(rows[0].end_date);
+    const today = new Date();
+
+    if (endDate >= today) {
+      res.json({ isSubscribed: true, endDate });
+    } else {
+      res.json({ isSubscribed: false, endDate });
+    }
+
+  } catch (err) {
+    console.error('❌ Check-subscription Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
 
 
 
@@ -1420,6 +1580,512 @@ app.post('/api/save-device-token', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'فشل في حفظ التوكن' });
   }
 });
+
+
+
+app.get('/api/admin-properties-cleaned/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      TRIM(SUBSTRING_INDEX(rcd.property_national_address, ',', -1)) AS address_cleaned,
+      COUNT(DISTINCT rcd.property_id) AS properties_count,
+      MAX(rcd.property_units_count) AS units_count
+    FROM rental_contracts_details rcd
+    JOIN users u ON u.id = rcd.tenant_id
+    WHERE rcd.admin_id = ?
+      AND u.fcm_token IS NOT NULL
+      AND u.fcm_token != ''
+    GROUP BY address_cleaned
+    ORDER BY address_cleaned ASC;
+  `;
+
+  try {
+    const rows = await query(sql, [adminId]);
+    res.json({ properties: rows });
+  } catch (err) {
+    console.error('❌ admin-properties-cleaned Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.get('/api/property-tenants/:cleanedAddress/:adminId', verifyToken, async (req, res) => {
+  const { cleanedAddress, adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      u.user_id AS tenant_id,
+      rcd.tenant_name,
+      rcd.tenant_phone,
+      rcd.tenant_email,
+      rcd.unit_number,
+      rcd.unit_floor_number,
+      rcd.unit_area
+    FROM rental_contracts_details rcd
+    JOIN users u ON u.id = rcd.tenant_id
+    WHERE rcd.admin_id = ?
+      AND TRIM(SUBSTRING_INDEX(rcd.property_national_address, ',', -1)) = ?
+      AND u.fcm_token IS NOT NULL
+      AND u.fcm_token != ''
+    GROUP BY u.user_id
+  `;
+
+  try {
+    const tenants = await query(sql, [adminId, cleanedAddress]);
+    res.json({ tenants });
+  } catch (err) {
+    console.error('❌ property-tenants Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+app.get('/api/tenants-by-admin/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      u.user_id AS tenant_id,
+      rcd.tenant_name,
+      rcd.tenant_phone
+    FROM rental_contracts_details rcd
+    JOIN users u ON u.id = rcd.tenant_id
+    WHERE rcd.admin_id = ?
+      AND u.fcm_token IS NOT NULL
+      AND u.fcm_token != ''
+    GROUP BY u.user_id
+    ORDER BY rcd.tenant_name ASC;
+  `;
+
+  try {
+    const tenants = await query(sql, [adminId]);
+    res.json({ tenants });
+  } catch (err) {
+    console.error('❌ tenants-by-admin Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+// ✅ endpoint لإظهار الإشعارات التي أرسلها المالك للمستأجرين
+app.get('/api/admin-sent-notifications/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+  const { userType } = req.user;
+
+  if (userType !== 'admin' && userType !== 'super') {
+    return res.status(403).json({ message: '❌ لا تملك صلاحية الوصول لهذه البيانات' });
+  }
+
+  const sql = `
+    SELECT 
+      n.id,
+      n.title,
+      n.body,
+      n.created_at,
+      u.name AS target_name
+    FROM notifications n
+    JOIN users u ON n.user_id = u.user_id
+    WHERE n.sender_id = ?
+    ORDER BY n.created_at DESC
+  `;
+
+  try {
+    const rows = await query(sql, [adminId]);
+    res.json({ notifications: rows });
+  } catch (err) {
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+// ✅ endpoint جديد لإظهار الإشعارات التي وصلت إلى المالك من السوبر أدمن
+app.get('/api/admin-received-notifications/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT id, title, body, created_at, is_read
+    FROM notifications
+    WHERE user_id = ? AND sender_id IS NULL
+    ORDER BY created_at DESC
+  `;
+
+  try {
+    const rows = await query(sql, [adminId]);
+    res.json({ notifications: rows });
+  } catch (err) {
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+
+
+
+app.post('/api/admin/send-notification', verifyToken, async (req, res) => {
+  const { userType, id: adminId } = req.user;
+  const { title, body, userId, userIds } = req.body;
+
+  if (userType !== 'admin') {
+    return res.status(403).json({ message: '❌ فقط المالك يمكنه استخدام هذا المسار' });
+  }
+
+  if (!title || !body) {
+    return res.status(400).json({ message: '❗ العنوان والمحتوى مطلوبان' });
+  }
+
+
+  const [adminUser] = await query(
+  'SELECT notifications_sent FROM users WHERE id = ?',
+  [adminId]
+);
+
+if (adminUser.notifications_sent >= 100) {
+  return res.status(403).json({
+    message: '⚠️ لقد استخدمت الحد المجاني (100 إشعار). يرجى الاشتراك لتفعيل المزيد.',
+  });
+}
+ 
+
+  let tokens = [];
+
+  // 📌 حالة فردية
+  if (userId) {
+    const sql = `
+  SELECT u.user_id, u.fcm_token
+  FROM users u
+  JOIN rental_contracts_details rcd ON u.id = rcd.tenant_id
+  WHERE u.user_id = ? 
+    AND rcd.admin_id = ?
+    AND u.fcm_token IS NOT NULL
+    AND u.fcm_token != ''
+  LIMIT 1
+`;
+
+    const result = await query(sql, [userId, adminId]);
+    if (result.length && result[0].fcm_token) {
+      tokens.push({ token: result[0].fcm_token, userId });
+    }
+  }
+
+  // 📌 حالة متعددة
+  else if (Array.isArray(userIds)) {
+    const placeholders = userIds.map(() => '?').join(',');
+    const sql = `
+  SELECT u.user_id, u.fcm_token
+  FROM users u
+  JOIN rental_contracts_details rcd ON u.id = rcd.tenant_id
+  WHERE u.user_id IN (${placeholders})
+    AND rcd.admin_id = ?
+    AND u.fcm_token IS NOT NULL  -- ✅ فقط من لديه FCM
+  GROUP BY u.user_id
+`;
+
+    const results = await query(sql, [...userIds, adminId]);
+    tokens = results.filter(row => row.fcm_token).map(row => ({
+      token: row.fcm_token,
+      userId: row.user_id
+    }));
+  }
+
+  if (!tokens.length) {
+    return res.status(404).json({ message: '❌ لا يوجد مستلمين صالحين' });
+  }
+
+  const accessToken = await getAccessToken();
+
+  for (const { token, userId } of tokens) {
+   const message = {
+  message: {
+    token,
+    notification: { title, body },
+    data: {
+      screen: 'notifications',
+      userId,
+      userType: 'user',
+      senderType: 'admin'  // ✅ ضروري لإظهار صفحة المستأجر مش المالك
+    }
+  }
+};
+
+
+    try {
+      await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(message),
+      });
+
+    await query(`
+  INSERT INTO notifications (user_id, title, body, sender_id)
+  VALUES (?, ?, ?, ?)
+`, [userId, title, body, adminId]);
+
+await query(
+  'UPDATE users SET notifications_sent = notifications_sent + 1 WHERE id = ?',
+  [adminId]
+);
+
+    } catch (err) {
+      console.error(`❌ فشل إرسال الإشعار لـ ${userId}:`, err);
+    }
+  }
+
+  res.json({
+  message: `✅ تم إرسال الإشعار إلى ${tokens.length} مستأجر`,
+  sender_id: adminId
+});
+});
+
+app.get('/api/admin/late-payments-notifications/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      p.payment_number, p.payment_amount, p.due_date, p.payment_status,
+      rcd.contract_number, rcd.tenant_name, u.id as tenant_id,
+      CASE WHEN lpn.last_sent_date = CURDATE() THEN TRUE ELSE FALSE END AS notification_sent_today
+    FROM payments p
+    JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+    JOIN users u ON rcd.tenant_id = u.id
+    LEFT JOIN late_payment_notifications lpn ON lpn.tenant_id = u.id AND lpn.admin_id = ? AND lpn.last_sent_date = CURDATE()
+    WHERE rcd.admin_id = ? 
+      AND p.payment_status != 'مدفوعة' 
+      AND p.due_date < CURDATE()
+    ORDER BY p.due_date ASC
+  `;
+
+  try {
+    const arrears = await query(sql, [adminId, adminId]);
+    res.json({ arrears });
+
+  } catch (err) {
+    console.error('❌ Late payments notifications Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+app.post('/api/admin/send-late-payment-notification', verifyToken, async (req, res) => {
+  const { adminId, tenantId, title, body } = req.body;
+
+  if (!adminId || !tenantId || !title || !body) {
+    return res.status(400).json({ message: '❗ جميع الحقول مطلوبة: adminId, tenantId, title, body.' });
+  }
+
+  try {
+    // جلب بيانات المستأجر
+    const tenantResult = await query('SELECT id, user_id, fcm_token, name FROM users WHERE user_id = ?', [tenantId]);
+    if (!tenantResult.length) {
+      console.warn(`🚫 المستأجر غير موجود: user_id=${tenantId}`);
+      return res.status(404).json({ message: '❌ المستأجر غير موجود.' });
+    }
+
+    const { id: tenantDbId, user_id: userId, fcm_token: token, name: tenantName } = tenantResult[0];
+    const accessToken = await getAccessToken();
+
+    let fcmStatus = 'لم يتم الإرسال (لا يوجد FCM Token)';
+    let fcmError = null;
+
+    // إذا يوجد FCM Token أرسل الإشعار عبر FCM
+    if (token) {
+      const message = {
+        message: {
+          token,
+          notification: { title, body },
+          data: {
+            screen: 'notifications',
+            userId,
+            userType: 'user',
+            senderType: 'admin'
+          }
+        }
+      };
+
+      const response = await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(message)
+        }
+      );
+
+      const responseBody = await response.text();
+      if (response.ok) {
+        fcmStatus = 'تم الإرسال بنجاح عبر FCM ✅';
+        console.log(`✅ [FCM] تم إرسال إشعار للمستأجر (${tenantName} - ${userId})`);
+      } else {
+        // حاول قراءة تفاصيل الخطأ
+        let errorDetail;
+        try {
+          errorDetail = JSON.parse(responseBody);
+        } catch (e) {
+          errorDetail = responseBody;
+        }
+        fcmStatus = 'فشل إرسال FCM ❌';
+        fcmError = errorDetail;
+        console.error(`❌ [FCM] خطأ أثناء إرسال الإشعار للمستأجر (${tenantName} - ${userId}):`, errorDetail);
+
+        // إذا التوكن UNREGISTERED احذفه من قاعدة البيانات
+        if (
+          errorDetail &&
+          errorDetail.error &&
+          errorDetail.error.details &&
+          Array.isArray(errorDetail.error.details)
+        ) {
+          const fcmErr = errorDetail.error.details.find(
+            (d) => d.errorCode === 'UNREGISTERED'
+          );
+          if (fcmErr) {
+            await query('UPDATE users SET fcm_token = NULL WHERE user_id = ?', [userId]);
+            console.warn(`⚠️ تم حذف FCM Token غير صالح للمستأجر (${tenantName} - ${userId})`);
+            fcmStatus += ' | تم حذف التوكن غير الصالح من قاعدة البيانات.';
+          }
+        }
+      }
+    } else {
+      console.warn(`⚠️ لا يوجد FCM Token للمستأجر (${tenantName} - ${userId})`);
+    }
+
+    // تسجيل تاريخ إرسال الإشعار في قاعدة البيانات (حتى لو لم يوجد FCM)
+    await query(`
+      INSERT INTO late_payment_notifications (admin_id, tenant_id, last_sent_date)
+      VALUES (?, ?, CURDATE())
+      ON DUPLICATE KEY UPDATE last_sent_date = CURDATE()
+    `, [adminId, tenantDbId]);
+
+    // رسالة واضحة للمالك
+    let clientMsg = '';
+    if (token && fcmStatus.startsWith('تم الإرسال')) {
+      clientMsg = `✅ تم إرسال الإشعار إلى "${tenantName}" (${userId}) بنجاح.`;
+    } else if (token && fcmError) {
+      clientMsg = `⚠️ لم يتم إرسال الإشعار عبر FCM بسبب مشكلة في التوكن. تم تسجيل العملية فقط.`;
+    } else {
+      clientMsg = `⚠️ لم يتم إرسال الإشعار لأن المستأجر "${tenantName}" لم يسجل دخول في التطبيق بعد أو حذف التطبيق. تم تسجيل العملية فقط.`;
+    }
+
+    res.json({
+      message: clientMsg,
+      fcmStatus,
+      fcmError
+    });
+
+  } catch (err) {
+    console.error('❌ Error sending late payment notification:', err);
+    res.status(500).json({ message: '❌ خطأ في إرسال الإشعار', error: err });
+  }
+});
+
+
+app.get('/api/admin-arrears-with-fcm/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  const sql = `
+    SELECT 
+      p.payment_number, p.payment_amount, p.due_date, p.payment_status,
+      rcd.contract_number, rcd.tenant_name,
+      u.user_id, u.fcm_token
+    FROM payments p
+    JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+    JOIN users u ON rcd.tenant_id = u.id
+    WHERE rcd.admin_id = ? 
+      AND p.payment_status != 'مدفوعة'
+      AND p.due_date < CURDATE()
+      AND u.fcm_token IS NOT NULL
+      AND u.fcm_token != ''
+    ORDER BY p.due_date ASC
+  `;
+
+  try {
+    const arrears = await query(sql, [adminId]);
+    res.json({ arrears });
+
+  } catch (err) {
+    console.error('❌ Admin-arrears-with-fcm Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+
+app.post('/api/admin/set-default-late-notification', verifyToken, async (req, res) => {
+  const { adminId, title, body } = req.body;
+
+  // اطبع القيم المستلمة من الواجهة
+  console.log('🔵 [set-default-late-notification] adminId:', adminId, 'title:', title, 'body:', body);
+
+  if (!adminId || !title || !body) {
+    return res.status(400).json({ message: 'adminId, title, body مطلوبة.' });
+  }
+
+  try {
+    // التحقق من وجود adminId في جدول المستخدمين
+    const adminExists = await query('SELECT id FROM users WHERE id = ?', [adminId]);
+    console.log('🟢 [set-default-late-notification] adminExists:', adminExists);
+
+    if (adminExists.length === 0) {
+      return res.status(404).json({ message: '❌ هذا المالك غير موجود.' });
+    }
+
+    // حفظ أو تحديث الإشعار الافتراضي
+    const result = await query(`
+      INSERT INTO admin_default_notifications (admin_id, title, body)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE title = VALUES(title), body = VALUES(body)
+    `, [adminId, title, body]);
+
+    console.log('🟢 [set-default-late-notification] DB result:', result);
+
+    res.json({ message: '✅ تم تحديث النص الافتراضي للإشعار.' });
+
+  } catch (err) {
+    console.error('❌ Error updating default notification:', err);
+    res.status(500).json({ message: '❌ فشل تحديث النص الافتراضي.', error: err });
+  }
+});
+
+
+app.get('/api/admin/get-default-late-notification/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  // القيم الافتراضية الدائمة
+  const defaultNotification = {
+    title: 'تنبيه بالدفعة المتأخرة',
+    body: 'عزيزي المستأجر، لديك دفعة متأخرة. يرجى السداد في أقرب وقت.'
+  };
+
+  try {
+    const results = await query(`
+      SELECT title, body 
+      FROM admin_default_notifications 
+      WHERE admin_id = ?
+    `, [adminId]);
+
+    if (results.length > 0) {
+      res.json({ notification: results[0] });
+    } else {
+      res.json({ notification: defaultNotification });
+    }
+
+  } catch (err) {
+    console.error('❌ Error fetching default notification:', err);
+    res.status(500).json({ message: '❌ فشل في جلب النص الافتراضي.', error: err });
+  }
+});
+
+
+
+
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1501,7 +2167,7 @@ app.post('/api/maintenance-request', verifyToken, async (req, res) => {
 
 
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // ✅ API: سجل طلبات الصيانة للمستأجر
 app.get('/api/maintenance-history/:userId', verifyToken, async (req, res) => {
   const { userId } = req.params;
@@ -1568,6 +2234,179 @@ app.get('/api/last-maintenance-request', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'خطأ في استرجاع البيانات' });
   }
 });
+
+
+app.get('/api/maintenance-requests/admin', verifyToken, async (req, res) => {
+  const { userType, id: adminId } = req.user;
+
+  if (userType !== 'admin') {
+    return res.status(403).json({ message: '❌ فقط المالك يمكنه عرض هذه الطلبات' });
+  }
+
+  const sql = `
+    SELECT mr.id, mr.category, mr.description, mr.status, mr.created_at,
+           rcd.tenant_name, rcd.unit_number, rcd.tenant_phone
+    FROM maintenance_requests mr
+    JOIN rental_contracts_details rcd ON mr.tenant_id = rcd.tenant_id
+    WHERE mr.owner_id = ?
+    ORDER BY mr.created_at DESC
+  `;
+
+  try {
+    const requests = await query(sql, [adminId]);
+    res.json({ requests });
+
+  } catch (err) {
+    console.error('❌ Maintenance-requests-admin Error:', err);
+    res.status(500).json({ message: '❌ خطأ في جلب الطلبات' });
+  }
+});
+
+
+
+app.put('/api/maintenance-requests/:id/status', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const requestId = req.params.id;
+  const { status, admin_notes } = req.body;
+
+  if (userType !== 'admin') {
+    return res.status(403).json({ message: '❌ فقط المالك يمكنه تحديث الحالة' });
+  }
+
+  if (!['جديد', 'قيد التنفيذ', 'تم التنفيذ'].includes(status)) {
+    return res.status(400).json({ message: '❗ حالة غير صالحة' });
+  }
+
+  const updateSql = `
+    UPDATE maintenance_requests 
+    SET status = ?, admin_notes = ?
+    WHERE id = ?
+  `;
+
+  try {
+    await query(updateSql, [status, admin_notes || null, requestId]);
+
+    // جلب بيانات الطلب
+    const [request] = await query(
+      `SELECT tenant_id, owner_id, category, description, admin_notes, created_at FROM maintenance_requests WHERE id = ?`,
+      [requestId]
+    );
+
+    if (status === 'تم التنفيذ') {
+      const archiveSql = `
+        INSERT INTO archived_maintenance_requests (tenant_id, owner_id, category, description, status, admin_notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `;
+
+      await query(archiveSql, [
+        request.tenant_id,
+        request.owner_id,
+        request.category,
+        request.description,
+        status,
+        request.admin_notes,
+        request.created_at,
+      ]);
+
+      // حذف الطلب الأصلي بعد الأرشفة
+      await query(`DELETE FROM maintenance_requests WHERE id = ?`, [requestId]);
+    }
+
+    // جلب FCM Token للمستأجر
+    const [tenant] = await query(
+      `SELECT fcm_token, user_id FROM users WHERE id = ?`,
+      [request.tenant_id]
+    );
+
+    if (tenant && tenant.fcm_token) {
+      const accessToken = await getAccessToken();
+      const message = {
+        message: {
+          token: tenant.fcm_token,
+          notification: {
+            title: 'تحديث حالة طلب الصيانة',
+            body: `تم تحديث حالة طلب الصيانة (${request.category}) إلى: ${status}`,
+          },
+          data: {
+            screen: 'maintenance',
+            status,
+          },
+        },
+      };
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(message),
+        }
+      );
+    }
+
+    res.json({ message: '✅ تم تحديث حالة الطلب بنجاح' });
+
+  } catch (err) {
+    console.error('❌ Update-maintenance-request-status Error:', err);
+    res.status(500).json({ message: '❌ فشل في تحديث الطلب' });
+  }
+});
+
+
+
+app.get('/api/maintenance-requests/archived', verifyToken, async (req, res) => {
+  const { userType, id: adminId } = req.user;
+
+  if (userType !== 'admin') {
+    return res.status(403).json({ message: '❌ فقط المالك يمكنه الوصول إلى هذه البيانات' });
+  }
+
+  const sql = `
+    SELECT id, tenant_id, owner_id, category, description, status, admin_notes, created_at, archived_at
+    FROM archived_maintenance_requests 
+    WHERE owner_id = ? 
+    ORDER BY archived_at DESC
+  `;
+
+  try {
+    const archivedRequests = await query(sql, [adminId]);
+    res.json({ archivedRequests });
+
+  } catch (err) {
+    console.error('❌ Archived-Maintenance-Requests Error:', err);
+    res.status(500).json({ message: '❌ خطأ في جلب البيانات المؤرشفة' });
+  }
+});
+
+
+app.get('/api/noise-complaints/archived', verifyToken, async (req, res) => {
+  const { userType, id: adminId } = req.user;
+
+  if (userType !== 'admin') {
+    return res.status(403).json({ message: '❌ فقط المالك يمكنه الوصول إلى هذه البيانات' });
+  }
+
+  const sql = `
+    SELECT id, tenant_id, admin_id, category, description, status, admin_notes, created_at, archived_at
+    FROM archived_noise_complaints 
+    WHERE admin_id = ? 
+    ORDER BY archived_at DESC
+  `;
+
+  try {
+    const archivedComplaints = await query(sql, [adminId]);
+    res.json({ archivedComplaints });
+
+  } catch (err) {
+    console.error('❌ Archived-Noise-Complaints Error:', err);
+    res.status(500).json({ message: '❌ خطأ في جلب البيانات المؤرشفة' });
+  }
+});
+
+
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2101,8 +2940,12 @@ app.get('/api/noise-complaints/admin', verifyToken, async (req, res) => {
   }
 
   const sql = `
-    SELECT id, category, description, status, created_at
-    FROM noise_complaints WHERE admin_id = ? ORDER BY created_at DESC
+    SELECT nc.id, nc.category, nc.description, nc.status, nc.created_at,
+           rcd.tenant_name, rcd.unit_number, rcd.tenant_phone
+    FROM noise_complaints nc
+    JOIN rental_contracts_details rcd ON nc.tenant_id = rcd.tenant_id
+    WHERE nc.admin_id = ?
+    ORDER BY nc.created_at DESC
   `;
 
   try {
@@ -2114,6 +2957,7 @@ app.get('/api/noise-complaints/admin', verifyToken, async (req, res) => {
     res.status(500).json({ message: '❌ خطأ في جلب البلاغات' });
   }
 });
+
 
 
 app.put('/api/noise-complaints/:id/status', verifyToken, async (req, res) => {
@@ -2129,19 +2973,82 @@ app.put('/api/noise-complaints/:id/status', verifyToken, async (req, res) => {
     return res.status(400).json({ message: '❗ حالة غير صالحة' });
   }
 
-  const sql = `
+  const updateSql = `
     UPDATE noise_complaints SET status = ? WHERE id = ?
   `;
 
   try {
-    await query(sql, [status, complaintId]);
-    res.json({ message: '✅ تم تحديث حالة البلاغ' });
+    await query(updateSql, [status, complaintId]);
+
+    // جلب بيانات البلاغ
+    const [complaint] = await query(
+      `SELECT tenant_id, admin_id, category, description, admin_notes, created_at FROM noise_complaints WHERE id = ?`,
+      [complaintId]
+    );
+
+    if (status === 'تم الحل') {
+      const archiveSql = `
+        INSERT INTO archived_noise_complaints (tenant_id, admin_id, category, description, status, admin_notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `;
+
+      await query(archiveSql, [
+        complaint.tenant_id,
+        complaint.admin_id,
+        complaint.category,
+        complaint.description,
+        status,
+        complaint.admin_notes,
+        complaint.created_at,
+      ]);
+
+      // حذف البلاغ الأصلي بعد الأرشفة
+      await query(`DELETE FROM noise_complaints WHERE id = ?`, [complaintId]);
+    }
+
+    // جلب FCM Token للمستأجر
+    const [tenant] = await query(
+      `SELECT fcm_token, user_id FROM users WHERE id = ?`,
+      [complaint.tenant_id]
+    );
+
+    if (tenant && tenant.fcm_token) {
+      const accessToken = await getAccessToken();
+      const message = {
+        message: {
+          token: tenant.fcm_token,
+          notification: {
+            title: 'تحديث حالة بلاغ الإزعاج',
+            body: `تم تحديث حالة بلاغ (${complaint.category}) إلى: ${status}`,
+          },
+          data: {
+            screen: 'noise',
+            status,
+          },
+        },
+      };
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(message),
+        }
+      );
+    }
+
+    res.json({ message: '✅ تم تحديث حالة البلاغ بنجاح' });
 
   } catch (err) {
     console.error('❌ Update-complaint-status Error:', err);
-    res.status(500).json({ message: '❌ فشل في التحديث' });
+    res.status(500).json({ message: '❌ فشل في تحديث الحالة' });
   }
 });
+
 
 
 
@@ -2203,6 +3110,61 @@ app.get('/api/noise-complaints/:id', verifyToken, async (req, res) => {
   }
 });
 
+
+app.get('/api/admin/all-notifications/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  try {
+    // جلب إشعارات الصيانة
+    const maintenance = await query(
+      `SELECT id, tenant_id, description, status, created_at 
+       FROM maintenance_requests 
+       WHERE admin_id = ? 
+       ORDER BY created_at DESC`,
+      [adminId]
+    );
+
+    // جلب بلاغات الإزعاج
+    const noise = await query(
+      `SELECT id, tenant_id, category, description, status, created_at 
+       FROM noise_complaints 
+       WHERE admin_id = ? 
+       ORDER BY created_at DESC`,
+      [adminId]
+    );
+
+    // دمج النتائج مع نوع الإشعار
+    const notifications = [
+      ...maintenance.map(item => ({
+        type: 'maintenance',
+        id: item.id,
+        tenant_id: item.tenant_id,
+        title: 'طلب صيانة',
+        description: item.description,
+        status: item.status,
+        created_at: item.created_at,
+      })),
+      ...noise.map(item => ({
+        type: 'noise',
+        id: item.id,
+        tenant_id: item.tenant_id,
+        title: item.category || 'بلاغ إزعاج',
+        description: item.description,
+        status: item.status,
+        created_at: item.created_at,
+      })),
+    ];
+
+    // ترتيب حسب الأحدث
+    notifications.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    res.json({ notifications });
+
+  } catch (err) {
+    console.error('❌ All-notifications Error:', err);
+    res.status(500).json({ message: 'خطأ داخلي في جلب الإشعارات', error: err });
+  }
+});
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2632,7 +3594,6 @@ app.get('/api/admin-finance-6months/:adminId', verifyToken, async (req, res) => 
   GROUP BY years.year, periods.start_month, periods.end_month
   ORDER BY years.year DESC, periods.start_month DESC
 `;
-
   try {
     const rows = await query(sql, [adminId]);
     res.json({ six_months: rows });
@@ -2739,6 +3700,8 @@ await bucket.upload(tempPath, {
     cacheControl: 'public, max-age=31536000',
   },
 });
+
+
 
 const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
 const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
@@ -2964,6 +3927,55 @@ await query(updateSql, updateValues);
     res.status(500).json({ message: 'خطأ في تجديد العقد', error: err });
   }
 });
+
+
+app.get('/api/contracts-archive', verifyToken, async (req, res) => {
+  const sql = `
+    SELECT 
+      archive_id, tenant_name, contract_number, archived_at
+    FROM contracts_archive
+    ORDER BY archived_at DESC
+  `;
+
+  try {
+    const rows = await query(sql);
+    res.json({ archived_contracts: rows });
+  } catch (err) {
+    console.error('❌ Contracts-Archive List Error:', err);
+    res.status(500).json({ message: 'فشل في جلب العقود المؤرشفة', error: err });
+  }
+});
+
+
+app.get('/api/contracts-archive/:archiveId', verifyToken, async (req, res) => {
+  const { archiveId } = req.params;
+
+  const sql = `
+    SELECT *
+    FROM contracts_archive
+    WHERE archive_id = ?
+    LIMIT 1
+  `;
+
+  try {
+    
+    const [contract] = await query(sql, [archiveId]);
+
+    if (!contract) {
+      return res.status(404).json({ message: 'لم يتم العثور على العقد المؤرشف' });
+    }
+
+    res.json({ contract });
+  } catch (err) {
+    console.error('❌ Contract Archive Details Error:', err);
+    res.status(500).json({ message: 'فشل في جلب تفاصيل العقد', error: err });
+  }
+});
+
+
+
+
+
 
 
 
