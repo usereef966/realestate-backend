@@ -629,6 +629,19 @@ app.post('/api/analyze-local-pdf', upload.single('pdf'), async (req, res) => {
 
     const user_id = data.tenant_id_number;
 
+    const today = new Date();
+    const contractEndDate = new Date(data.contract_end);
+
+    // 👇 شرط ذكي لإضافة المستخدم إذا العقد ما زال ساريًا
+    if (contractEndDate <= today) {
+      return res.status(400).json({
+        message: '❌ لا يمكن إنشاء مستخدم لأن العقد منتهي أو ينتهي اليوم.',
+        contract_end: data.contract_end
+      });
+    }
+    // 👇 شرط ذكي لإضافة المستخدم إذا العقد ما زال ساريًا
+
+
     if (!user_id) {
       return res.status(400).json({ message: '❌ تعذّر استخراج رقم الهوية من الملف.' });
     }
@@ -3410,7 +3423,7 @@ app.get('/api/admin-finance-summary/:adminId', verifyToken, async (req, res) => 
       IFNULL(SUM(total_contract_value), 0) AS total_contracts,
       COUNT(*) AS contracts_count
     FROM rental_contracts_details
-    WHERE admin_id = ?
+    WHERE admin_id = ? AND contract_end > CURDATE()
   `;
 
   const paymentsSumSql = `
@@ -3418,7 +3431,7 @@ app.get('/api/admin-finance-summary/:adminId', verifyToken, async (req, res) => 
       IFNULL(SUM(p.payment_amount), 0) AS total_paid
     FROM payments p
     JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
-    WHERE rcd.admin_id = ? AND p.payment_status = 'مدفوعة'
+    WHERE rcd.admin_id = ? AND p.payment_status = 'مدفوعة' AND rcd.contract_end > CURDATE()
   `;
 
   try {
@@ -3445,6 +3458,7 @@ app.get('/api/admin-finance-summary/:adminId', verifyToken, async (req, res) => 
 
 
 
+
 app.get('/api/admin-finance-monthly/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
 
@@ -3461,6 +3475,7 @@ app.get('/api/admin-finance-monthly/:adminId', verifyToken, async (req, res) => 
     JOIN rental_contracts_details rcd 
       ON rcd.admin_id = ? 
       AND date_range.month BETWEEN DATE_FORMAT(rcd.contract_start, '%Y-%m-01') AND DATE_FORMAT(rcd.contract_end, '%Y-%m-01')
+      AND rcd.contract_end > CURDATE()
     GROUP BY month
     ORDER BY month DESC
   `;
@@ -3474,6 +3489,7 @@ app.get('/api/admin-finance-monthly/:adminId', verifyToken, async (req, res) => 
     res.status(500).json({ message: 'DB Error', error: err });
   }
 });
+
 
 
 
@@ -3498,6 +3514,7 @@ app.get('/api/admin-finance-yearly/:adminId', verifyToken, async (req, res) => {
         YEAR(rcd.contract_start) <= years.year 
         AND YEAR(rcd.contract_end) >= years.year
       )
+      AND rcd.contract_end > CURDATE()
     GROUP BY years.year
     ORDER BY years.year DESC
   `;
@@ -3526,7 +3543,7 @@ app.get('/api/admin-contracts-finance/:adminId', verifyToken, async (req, res) =
       (rcd.total_contract_value - IFNULL(SUM(p.payment_amount), 0)) AS remaining
     FROM rental_contracts_details rcd
     LEFT JOIN payments p ON p.contract_id = rcd.id AND p.payment_status = 'مدفوعة'
-    WHERE rcd.admin_id = ?
+    WHERE rcd.admin_id = ? AND rcd.contract_end > CURDATE()
     GROUP BY rcd.id
     ORDER BY rcd.contract_start DESC
   `;
@@ -3540,6 +3557,7 @@ app.get('/api/admin-contracts-finance/:adminId', verifyToken, async (req, res) =
     res.status(500).json({ message: 'DB Error', error: err });
   }
 });
+
 
 
 
@@ -3579,7 +3597,10 @@ app.get('/api/admin-arrears/:adminId', verifyToken, async (req, res) => {
       rcd.contract_number, rcd.tenant_name
     FROM payments p
     JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
-    WHERE rcd.admin_id = ? AND p.payment_status != 'مدفوعة' AND p.due_date < CURDATE()
+    WHERE rcd.admin_id = ? 
+      AND p.payment_status != 'مدفوعة' 
+      AND p.due_date < CURDATE()
+      AND rcd.contract_end > CURDATE()
     ORDER BY p.due_date ASC
   `;
 
@@ -3645,6 +3666,7 @@ app.get('/api/admin-finance-6months/:adminId', verifyToken, async (req, res) => 
     AND (
       DATE(rcd.contract_start) <= LAST_DAY(CONCAT(years.year, '-', periods.end_month, '-01'))
       AND DATE(rcd.contract_end) >= DATE(CONCAT(years.year, '-', periods.start_month, '-01'))
+      AND rcd.contract_end > CURDATE()
     )
   GROUP BY years.year, periods.start_month, periods.end_month
   ORDER BY years.year DESC, periods.start_month DESC
@@ -3660,6 +3682,7 @@ app.get('/api/admin-finance-6months/:adminId', verifyToken, async (req, res) => 
 });
 
 
+
 app.get('/api/admin-collection-rate/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
 
@@ -3668,9 +3691,9 @@ app.get('/api/admin-collection-rate/:adminId', verifyToken, async (req, res) => 
       (
         (SELECT IFNULL(SUM(p.payment_amount),0) FROM payments p
          JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
-         WHERE rcd.admin_id = ? AND p.payment_status = 'مدفوعة')
+         WHERE rcd.admin_id = ? AND p.payment_status = 'مدفوعة' AND rcd.contract_end > CURDATE())
         /
-        (SELECT IFNULL(SUM(total_contract_value),0) FROM rental_contracts_details WHERE admin_id = ?)
+        (SELECT IFNULL(SUM(total_contract_value),0) FROM rental_contracts_details WHERE admin_id = ? AND contract_end > CURDATE())
       ) * 100 AS collection_rate
   `;
 
@@ -3683,6 +3706,7 @@ app.get('/api/admin-collection-rate/:adminId', verifyToken, async (req, res) => 
     res.status(500).json({ message: 'DB Error', error: err });
   }
 });
+
 
 
 
@@ -3719,7 +3743,7 @@ app.get('/api/admin-properties-stats/:adminId', verifyToken, async (req, res) =>
       property_units_count AS units_count,
       COUNT(DISTINCT property_id) AS properties_count
     FROM rental_contracts_details
-    WHERE admin_id = ?
+    WHERE admin_id = ? AND contract_end > CURDATE()
     GROUP BY property_units_count
     ORDER BY property_units_count ASC;
   `;
@@ -3733,6 +3757,7 @@ app.get('/api/admin-properties-stats/:adminId', verifyToken, async (req, res) =>
     res.status(500).json({ message: 'DB Error', error: err });
   }
 });
+
 
 
 app.post('/api/renew-contract', upload.single('pdf'), async (req, res) => {
@@ -3889,10 +3914,24 @@ app.post('/api/renew-contract', upload.single('pdf'), async (req, res) => {
 
 
 
+
+
       pdf_path: publicUrl,
       tenant_id: null, // بنعبيها بعدين
       admin_id: admin_id
     };
+
+
+    const today = new Date();
+    const contractEndDate = new Date(data.contract_end);
+
+    if (contractEndDate <= today) {
+      return res.status(400).json({
+        message: '❌ لا يمكن تجديد العقد لأن تاريخ انتهاء العقد الجديد منتهي أو ينتهي اليوم.',
+        contract_end: data.contract_end
+      });
+    }
+
 
 
     // تحقق من وجود العقار أو أنشئه
