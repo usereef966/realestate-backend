@@ -37,14 +37,14 @@ function verifyToken(req, res, next) {
     if (err) {
       return res.status(403).json({ message: 'توكن غير صالح أو منتهي الصلاحية' });
     }
-    
+
     // ✅ أضف فقط السطرين التاليين:
     req.user = {
       userId: decoded.userId,     // لن يتأثر نظامك الحالي نهائيًا
       userType: decoded.userType, // لن يتأثر نظامك الحالي نهائيًا
       id: decoded.id              // 👈 فقط أضف هذا
     };
-    
+
     next();
   });
 }
@@ -321,7 +321,8 @@ app.get('/api/admin-token/:adminId', verifyToken, async (req, res) => {
 app.post('/api/generate-admin-token', verifyToken, async (req, res) => {
   const { permissions, created_by } = req.body;
 
-  const token = crypto.randomBytes(32).toString('hex');
+  const token = Math.floor(10000000 + Math.random() * 90000000).toString(); // ⬅️ توكن 8 أرقام
+
 
   const sql = `
     INSERT INTO admin_tokens (token, permissions, created_by)
@@ -341,7 +342,8 @@ app.post('/api/generate-admin-token', verifyToken, async (req, res) => {
 app.post('/api/generate-user-token', verifyToken, async (req, res) => {
   const { permissions, created_by } = req.body;
 
-  const token = crypto.randomBytes(32).toString('hex');
+  const token = Math.floor(10000000 + Math.random() * 90000000).toString(); // ⬅️ توكن 8 أرقام
+
 
   const sql = `
     INSERT INTO user_tokens (token, permissions, created_by)
@@ -360,8 +362,8 @@ app.post('/api/generate-user-token', verifyToken, async (req, res) => {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 app.post('/api/create-admin', verifyToken, async (req, res) => {
-  const { userType, id: created_by } = req.user; 
-  
+  const { userType, id: created_by } = req.user;
+
   if (userType !== 'super') {
     return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه إنشاء مالك.' });
   }
@@ -472,171 +474,177 @@ app.post('/api/analyze-local-pdf', upload.single('pdf'), async (req, res) => {
   console.log("File saved at:", req.file.path);
 
 
-  const user_id = req.body.tenantId;
+
   const admin_id = req.user?.id || req.body.adminId; // حسب كيف بتمرر الادمن
   let createdTenant = false;
   let createdToken = false;
   let tenantDbId, token;
 
   try {
-   const tempPath = req.file.path;
-const gcsFileName = `${Date.now()}-${req.file.originalname}`;
+    const tempPath = req.file.path;
+    const gcsFileName = `${Date.now()}-${req.file.originalname}`;
 
-await bucket.upload(tempPath, {
-  destination: gcsFileName,
-  resumable: false,
-  contentType: req.file.mimetype,
-  metadata: {
-    cacheControl: 'public, max-age=31536000',
-  },
-});
+    await bucket.upload(tempPath, {
+      destination: gcsFileName,
+      resumable: false,
+      contentType: req.file.mimetype,
+      metadata: {
+        cacheControl: 'public, max-age=31536000',
+      },
+    });
 
-const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
-const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
-const pdfData = await pdfParse(fileBuffer);   // ⬅️ تحليل الملف
-const text = pdfData.text;                    // ⬅️ النص اللي راح تستخدمه
-const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
-const toFloat = (v) => parseFloat(v) || 0;
-const toInt = (v) => parseInt(v) || 0;
-console.log('📄 Temp Path:', tempPath);
-console.log('📄 File Exists:', fs.existsSync(tempPath));
-console.log('📄 File Size:', fs.statSync(tempPath).size);
+    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+    const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
+    const pdfData = await pdfParse(fileBuffer);   // ⬅️ تحليل الملف
+    const text = pdfData.text;                    // ⬅️ النص اللي راح تستخدمه
+    const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
+    const toFloat = (v) => parseFloat(v) || 0;
+    const toInt = (v) => parseInt(v) || 0;
+    console.log('📄 Temp Path:', tempPath);
+    console.log('📄 File Exists:', fs.existsSync(tempPath));
+    console.log('📄 File Size:', fs.statSync(tempPath).size);
 
 
-    
 
-const data = {
-  contract_number: extract(/Contract No\.(.+?):العقد سجل رقم/),
-  contract_type: extract(/Contract Type(.+?):العقد نوع/),
-  contract_date: extract(/Contract Sealing Date(\d{4}-\d{2}-\d{2})/),
-  contract_start: extract(/Tenancy Start Date(\d{4}-\d{2}-\d{2})/),
-  contract_end: extract(/Tenancy End Date(\d{4}-\d{2}-\d{2})/),
-  contract_location: extract(/Location\n(.+?):العقد إبرام مكان/),
 
-  // Tenant Information
-  tenant_name: (() => {
-    let raw = '';
-    let match = text.match(/Name\s*الاسم:?\s*(.+)/);
-    if (match && match[1]) {
-      raw = match[1].trim();
-    } else {
-      match = text.match(/Tenant Data[\s\S]*?Name(.+?):الاسم/);
-      if (match && match[1]) raw = match[1].trim();
-    }
-    return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
-  })(),
+    const data = {
+      contract_number: extract(/Contract No\.(.+?):العقد سجل رقم/),
+      contract_type: extract(/Contract Type(.+?):العقد نوع/),
+      contract_date: extract(/Contract Sealing Date(\d{4}-\d{2}-\d{2})/),
+      contract_start: extract(/Tenancy Start Date(\d{4}-\d{2}-\d{2})/),
+      contract_end: extract(/Tenancy End Date(\d{4}-\d{2}-\d{2})/),
+      contract_location: extract(/Location\n(.+?):العقد إبرام مكان/),
 
-  tenant_nationality: extract(/Tenant Data[\s\S]*?Nationality(.+?):الجنسي/),
-  tenant_id_type: (() => {
-    const raw = extract(/Tenant Data[\s\S]*?ID Type(.+?):الهوي/).trim();
-    return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
-  })(),
-  tenant_id_number: extract(/Tenant Data[\s\S]*?ID No\.(\d+):الهوي/),
-  tenant_email: extract(/Tenant Data[\s\S]*?Email(.+?):الإلكتروني البريد/) || '-',
-  tenant_phone: extract(/Tenant Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
-  tenant_address: (() => {
-    const raw = extract(/Tenant Data[\s\S]*?National Address(.+?):الوطني العنوان/).trim();
-    if (!raw) return '';
-    const parts = raw.split(/,\s*/);
-    return parts.map(part => part.split(/\s+/).reverse().join(' ')).reverse().join(', ');
-  })(),
+      // Tenant Information
+      tenant_name: (() => {
+        let raw = '';
+        let match = text.match(/Name\s*الاسم:?\s*(.+)/);
+        if (match && match[1]) {
+          raw = match[1].trim();
+        } else {
+          match = text.match(/Tenant Data[\s\S]*?Name(.+?):الاسم/);
+          if (match && match[1]) raw = match[1].trim();
+        }
+        return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
+      })(),
 
-  // Owner Information
-  owner_name: extract(/Lessor Data[\s\S]*?Name(.+?):الاسم/).split(' ').reverse().join(' '),
-  owner_nationality: (() => {
-    const lines = text.split('\n');
-    const i = lines.findIndex(line => line.includes('Nationality'));
-    if (i !== -1 && lines[i + 1] && lines[i + 2]) {
-      const raw = `${lines[i + 1].trim()} ${lines[i + 2].trim()}`;
-      const words = raw.split(/\s+/);
-      if (words.includes('السعودية') && words.includes('العربية') && words.includes('المملكة')) {
-        return 'المملكة العربية السعودية';
-      }
-      return raw;
-    }
-    return (i !== -1 && lines[i + 1]) ? lines[i + 1].trim() : '';
-  })(),
-  owner_id_type: (() => {
-    const lines = text.split('\n');
-    const idx = lines.findIndex(line => line.includes('ID Type'));
-    let result = '';
-    if (idx !== -1) {
-      const line = lines[idx];
-      const match = line.match(/ID Type\s*([^\:]+):الهوي/);
-      if (match && match[1]) result = match[1].trim();
-      else {
-        const start = line.indexOf('ID Type') + 'ID Type'.length;
-        const end = line.indexOf(':الهوي');
-        if (end > start) result = line.substring(start, end).trim();
-      }
-    }
-    if (result) {
-      const words = result.split(/\s+/);
-      if (words.length === 2 && (words[0].endsWith('ية') || words[0].endsWith('يم'))) {
-        return `${words[1]} ${words[0]}`;
-      }
-    }
-    return result;
-  })(),
-  owner_id_number: extract(/Lessor Data[\s\S]*?ID No\.(\d+):الهوي/),
-  owner_email: extract(/Lessor Data[\s\S]*?Email(.+?):الإلكتروني البريد/),
-  owner_phone: extract(/Lessor Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
-  owner_address: (() => {
-    let addr = '';
-    const match = text.match(/National Address\s*:?([^\n:]+):الوطني العنوان/);
-    if (match && match[1]) addr = match[1].replace(/\s+/g, ' ').trim();
-    else {
-      const alt = text.match(/العنوان الوطني:\s*([^\n:]+)\s*Address National/);
-      if (alt && alt[1]) addr = alt[1].replace(/\s+/g, ' ').trim();
-    }
-    return addr.split(/\s+/).reverse().join(' ');
-  })(),
+      tenant_nationality: extract(/Tenant Data[\s\S]*?Nationality(.+?):الجنسي/),
+      tenant_id_type: (() => {
+        const raw = extract(/Tenant Data[\s\S]*?ID Type(.+?):الهوي/).trim();
+        return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
+      })(),
+      tenant_id_number: extract(/Tenant Data[\s\S]*?ID No\.(\d+):الهوي/),
+      tenant_email: extract(/Tenant Data[\s\S]*?Email(.+?):الإلكتروني البريد/) || '-',
+      tenant_phone: extract(/Tenant Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
+      tenant_address: (() => {
+        const raw = extract(/Tenant Data[\s\S]*?National Address(.+?):الوطني العنوان/).trim();
+        if (!raw) return '';
+        const parts = raw.split(/,\s*/);
+        return parts.map(part => part.split(/\s+/).reverse().join(' ')).reverse().join(', ');
+      })(),
 
-  // Financial Data
-  annual_rent: toFloat(extract(/Annual Rent\s*(\d+\.\d+)/)),
-  periodic_rent_payment: toFloat(extract(/Regular Rent Payment:\s*(\d+\.\d+)/)),
-  rent_payment_cycle: extract(/Rent payment cycle\s*(\S+)/).replace(/الايجار.*/, '').trim(),
-  rent_payments_count: toInt(extract(/Number of Rent\s*Payments:\s*(\d+)/)),
-  total_contract_value: toFloat(extract(/Total Contract value\s*(\d+\.\d+)/)),
+      // Owner Information
+      owner_name: extract(/Lessor Data[\s\S]*?Name(.+?):الاسم/).split(' ').reverse().join(' '),
+      owner_nationality: (() => {
+        const lines = text.split('\n');
+        const i = lines.findIndex(line => line.includes('Nationality'));
+        if (i !== -1 && lines[i + 1] && lines[i + 2]) {
+          const raw = `${lines[i + 1].trim()} ${lines[i + 2].trim()}`;
+          const words = raw.split(/\s+/);
+          if (words.includes('السعودية') && words.includes('العربية') && words.includes('المملكة')) {
+            return 'المملكة العربية السعودية';
+          }
+          return raw;
+        }
+        return (i !== -1 && lines[i + 1]) ? lines[i + 1].trim() : '';
+      })(),
+      owner_id_type: (() => {
+        const lines = text.split('\n');
+        const idx = lines.findIndex(line => line.includes('ID Type'));
+        let result = '';
+        if (idx !== -1) {
+          const line = lines[idx];
+          const match = line.match(/ID Type\s*([^\:]+):الهوي/);
+          if (match && match[1]) result = match[1].trim();
+          else {
+            const start = line.indexOf('ID Type') + 'ID Type'.length;
+            const end = line.indexOf(':الهوي');
+            if (end > start) result = line.substring(start, end).trim();
+          }
+        }
+        if (result) {
+          const words = result.split(/\s+/);
+          if (words.length === 2 && (words[0].endsWith('ية') || words[0].endsWith('يم'))) {
+            return `${words[1]} ${words[0]}`;
+          }
+        }
+        return result;
+      })(),
+      owner_id_number: extract(/Lessor Data[\s\S]*?ID No\.(\d+):الهوي/),
+      owner_email: extract(/Lessor Data[\s\S]*?Email(.+?):الإلكتروني البريد/),
+      owner_phone: extract(/Lessor Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
+      owner_address: (() => {
+        let addr = '';
+        const match = text.match(/National Address\s*:?([^\n:]+):الوطني العنوان/);
+        if (match && match[1]) addr = match[1].replace(/\s+/g, ' ').trim();
+        else {
+          const alt = text.match(/العنوان الوطني:\s*([^\n:]+)\s*Address National/);
+          if (alt && alt[1]) addr = alt[1].replace(/\s+/g, ' ').trim();
+        }
+        return addr.split(/\s+/).reverse().join(' ');
+      })(),
 
-  // Property Information
-  property_usage: (() => {
-    const raw = extract(/Property Usage\s*(.+?)\s*استخدام/).trim();
-    return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
-  })(),
-  property_building_type: extract(/Property Type(.+?):العقار بناء نوع/),
-  property_units_count: toInt(extract(/Number of Units(\d+)/)),
-  property_floors_count: toInt(extract(/Number of Floors(\d+)/)),
-  property_national_address: extract(/Property Data[\s\S]*?National Address(.+?):الوطني العنوان/),
+      // Financial Data
+      annual_rent: toFloat(extract(/Annual Rent\s*(\d+\.\d+)/)),
+      periodic_rent_payment: toFloat(extract(/Regular Rent Payment:\s*(\d+\.\d+)/)),
+      rent_payment_cycle: extract(/Rent payment cycle\s*(\S+)/).replace(/الايجار.*/, '').trim(),
+      rent_payments_count: toInt(extract(/Number of Rent\s*Payments:\s*(\d+)/)),
+      total_contract_value: toFloat(extract(/Total Contract value\s*(\d+\.\d+)/)),
 
-  // Unit Information
-  unit_type: extract(/Unit Type(.+?):الوحدة نوع/),
-  unit_number: extract(/Unit No\.(.+?):الوحدة رقم/),
-  unit_floor_number: toInt(extract(/Floor No\.(\d+):الطابق رقم/)),
-  unit_area: toFloat(extract(/Unit Area(\d+\.\d+):الوحدة مساحة/)),
-  unit_furnishing_status: extract(/Furnishing Status\s*[-:]?\s*(.*?)\s*Number of AC units/),
-  unit_ac_units_count: toInt(extract(/Number of AC units(\d+)/)),
-  unit_ac_type: (() => {
-    const raw = extract(/AC Type(.+?)التكييف نوع/).trim();
-    return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
-  })(),
+      // Property Information
+      property_usage: (() => {
+        const raw = extract(/Property Usage\s*(.+?)\s*استخدام/).trim();
+        return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
+      })(),
+      property_building_type: extract(/Property Type(.+?):العقار بناء نوع/),
+      property_units_count: toInt(extract(/Number of Units(\d+)/)),
+      property_floors_count: toInt(extract(/Number of Floors(\d+)/)),
+      property_national_address: extract(/Property Data[\s\S]*?National Address(.+?):الوطني العنوان/),
 
-  pdf_path: publicUrl,
+      // Unit Information
+      unit_type: extract(/Unit Type(.+?):الوحدة نوع/),
+      unit_number: extract(/Unit No\.(.+?):الوحدة رقم/),
+      unit_floor_number: toInt(extract(/Floor No\.(\d+):الطابق رقم/)),
+      unit_area: toFloat(extract(/Unit Area(\d+\.\d+):الوحدة مساحة/)),
+      unit_furnishing_status: extract(/Furnishing Status\s*[-:]?\s*(.*?)\s*Number of AC units/),
+      unit_ac_units_count: toInt(extract(/Number of AC units(\d+)/)),
+      unit_ac_type: (() => {
+        const raw = extract(/AC Type(.+?)التكييف نوع/).trim();
+        return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
+      })(),
+      pdf_path: publicUrl,
       tenant_id: null, // بنعبيها بعدين
       admin_id: admin_id
     };
 
-    // === 1. تحقق/أنشئ المستأجر والتوكن ===
+    const user_id = data.tenant_id_number;
+
+    if (!user_id) {
+      return res.status(400).json({ message: '❌ تعذّر استخراج رقم الهوية من الملف.' });
+    }
+
     const userCheckSql = 'SELECT id FROM users WHERE user_id = ? LIMIT 1';
     const tenant_name_from_pdf = data.tenant_name || '---';
+
     try {
       const existing = await query(userCheckSql, [user_id]);
+
       if (existing.length === 0) {
-        token = crypto.randomBytes(32).toString('hex');
+        token = Math.floor(10000000 + Math.random() * 90000000).toString();
         const insertUserSql = `
-          INSERT INTO users (user_id, name, user_type, token, created_at, created_by)
-          VALUES (?, ?, 'user', ?, NOW(), ?)
-        `;
+      INSERT INTO users (user_id, name, user_type, token, created_at, created_by)
+      VALUES (?, ?, 'user', ?, NOW(), ?)
+    `;
         const userResult = await query(insertUserSql, [
           user_id,
           tenant_name_from_pdf,
@@ -647,56 +655,58 @@ const data = {
         createdTenant = true;
 
         const insertTokenSql = `
-          INSERT INTO user_tokens (token, permissions, created_by)
-          VALUES (?, ?, ?)
-        `;
+      INSERT INTO user_tokens (token, permissions, created_by)
+      VALUES (?, ?, ?)
+    `;
         await query(insertTokenSql, [token, '{}', admin_id]);
         createdToken = true;
       } else {
-        tenantDbId = existing[0].id;
-        // تحديث الاسم من PDF لو فاضي
-        await query('UPDATE users SET name = ? WHERE id = ?', [tenant_name_from_pdf, tenantDbId]);
+        // ✅ هنا يتم منع الإدخال لأن المستأجر موجود مسبقًا
+        return res.status(400).json({
+          message: '❌ هذا المستأجر مسجّل بالفعل برقم الهوية نفسه ولا يمكن إضافته مرة أخرى.'
+        });
       }
+      data.tenant_id = tenantDbId;
+
     } catch (err) {
       console.error('❌ User Creation Error:', err);
       return res.status(500).json({ message: 'فشل في إنشاء أو التحقق من المستأجر' });
     }
-    data.tenant_id = tenantDbId;
 
 
-    
+
 
     // === 2. إدخال بيانات العقد وكامل العملية بنفس المنطق ===
 
 
     // --- ابدأ من هنا (Property ID logic) ---
-let property_id;
-const [existingProperty] = await query(`
+    let property_id;
+    const [existingProperty] = await query(`
   SELECT property_id FROM properties
   WHERE property_national_address = ? AND admin_id = ?
   LIMIT 1
 `, [data.property_national_address, admin_id]);
 
-if (existingProperty) {
-  property_id = existingProperty.property_id;
-} else {
-  const insertResult = await query(`
+    if (existingProperty) {
+      property_id = existingProperty.property_id;
+    } else {
+      const insertResult = await query(`
     INSERT INTO properties (property_national_address, property_units_count, admin_id)
     VALUES (?, ?, ?)
   `, [data.property_national_address, data.property_units_count, admin_id]);
-  
-  property_id = insertResult.insertId;
-}
 
-// هنا تضيف property_id في البيانات
-data.property_id = property_id;
+      property_id = insertResult.insertId;
+    }
+
+    // هنا تضيف property_id في البيانات
+    data.property_id = property_id;
 
 
     const fields = Object.keys(data).join(', ');
     const values = Object.values(data);
     const placeholders = Object.keys(data).map(() => '?').join(', ');
 
-// --- انتهى الجزء الخاص بالـ Property ID ---
+    // --- انتهى الجزء الخاص بالـ Property ID ---
 
 
     const insertQuery = `INSERT INTO rental_contracts_details (${fields}) VALUES (${placeholders})`;
@@ -861,13 +871,57 @@ data.property_id = property_id;
       }
     }
   } catch (err) {
-  console.error('❌ PDF Analyze Error:', err.stack || err.message || err);
-  res.status(500).json({
-    message: 'فشل في تحليل الـ PDF',
-    error: err.message || err.toString(),
-  });
-}
+    console.error('❌ PDF Analyze Error:', err.stack || err.message || err);
+    res.status(500).json({
+      message: 'فشل في تحليل الـ PDF',
+      error: err.message || err.toString(),
+    });
+  }
 });
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+app.get('/api/download-contract/:tenantId', verifyToken, async (req, res) => {
+  const { tenantId } = req.params;
+
+  try {
+    // استعلام من قاعدة البيانات للحصول على رابط الملف
+    const result = await query(
+      'SELECT pdf_path FROM rental_contracts_details WHERE tenant_id = ? ORDER BY id DESC LIMIT 1',
+      [tenantId]
+    );
+
+    if (!result.length || !result[0].pdf_path) {
+      return res.status(404).json({ message: 'الملف غير موجود' });
+    }
+
+    // استخراج اسم الملف من الرابط
+    const pdfPath = result[0].pdf_path;
+    const filename = pdfPath.split('/').pop();
+
+    const file = bucket.file(filename);
+
+    // تحقق من وجود الملف
+    const [exists] = await file.exists();
+    if (!exists) {
+      return res.status(404).json({ message: 'الملف غير موجود في السحابة' });
+    }
+
+    // إنشاء رابط مؤقت صالح لساعة
+    const [signedUrl] = await file.getSignedUrl({
+      version: 'v4',
+      action: 'read',
+      expires: Date.now() + 60 * 60 * 1000,
+    });
+
+    res.json({ url: signedUrl });
+  } catch (error) {
+    console.error('❌ Download Error:', error);
+    res.status(500).json({ message: 'خطأ أثناء إنشاء الرابط المؤقت' });
+  }
+});
+
+
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 app.get('/api/profile/contract/:userId', verifyToken, async (req, res) => {
   const userId = req.params.userId;
@@ -939,13 +993,13 @@ app.get('/api/profile/tenant/:userId', verifyToken, async (req, res) => {
 
   try {
     const results = await query(sql, [userId]);
-
-    if(results.length === 0) 
+    ``
+    if (results.length === 0)
       return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
 
-  } catch(err) {
+  } catch (err) {
     console.error('❌ Profile-tenant Error:', err);
     res.status(500).json({ message: 'خطأ في الخادم' });
   }
@@ -968,12 +1022,12 @@ app.get('/api/profile/property/:userId', verifyToken, async (req, res) => {
   try {
     const results = await query(sql, [userId]);
 
-    if(results.length === 0) 
+    if (results.length === 0)
       return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
 
-  } catch(err) {
+  } catch (err) {
     console.error('❌ Profile-property Error:', err);
     res.status(500).json({ message: 'خطأ في الخادم' });
   }
@@ -998,12 +1052,12 @@ app.get('/api/profile/unit/:userId', verifyToken, async (req, res) => {
   try {
     const results = await query(sql, [userId]);
 
-    if (results.length === 0) 
+    if (results.length === 0)
       return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
 
-  } catch(err) {
+  } catch (err) {
     console.error('❌ Profile-unit Error:', err);
     res.status(500).json({ message: 'خطأ في الخادم' });
   }
@@ -1031,7 +1085,7 @@ app.get('/api/profile/finance/:userId', verifyToken, async (req, res) => {
 
     res.json(results[0]);
 
-  } catch(err) {
+  } catch (err) {
     console.error('❌ Profile-finance Error:', err);
     res.status(500).json({ message: 'خطأ في الخادم' });
   }
@@ -1052,12 +1106,12 @@ app.get('/api/profile/privacy/:userId', verifyToken, async (req, res) => {
   try {
     const results = await query(sql, [userId]);
 
-    if (results.length === 0) 
+    if (results.length === 0)
       return res.status(404).json({ message: 'لا توجد بيانات' });
 
     res.json(results[0]);
 
-  } catch(err) {
+  } catch (err) {
     console.error('❌ Profile-privacy Error:', err);
     res.status(500).json({ message: 'خطأ في الخادم' });
   }
@@ -1123,7 +1177,7 @@ app.post('/api/messages/send', verifyToken, async (req, res) => {
 
   try {
     const results = await query(getContractSql, [chatRoomId]);
-    
+
     if (results.length === 0) {
       console.error('خطأ في إيجاد العقد');
       return res.status(500).json({ message: 'خطأ في إيجاد العقد المرتبط بغرفة الدردشة' });
@@ -1146,13 +1200,13 @@ app.get('/api/messages/:chatRoomId', verifyToken, async (req, res) => {
   const { chatRoomId } = req.params;
   const userId = req.user.userId;
 
- 
+
 
   const checkSql = `
     SELECT * FROM chat_rooms 
     WHERE id = ? AND (tenant_user_id = ? OR admin_user_id = ?)
   `;
-  
+
   const messagesSql = `
     SELECT * FROM messages
     WHERE chat_room_id = ?
@@ -1161,7 +1215,7 @@ app.get('/api/messages/:chatRoomId', verifyToken, async (req, res) => {
 
   try {
     const checkResult = await query(checkSql, [chatRoomId, userId, userId]);
-    
+
     if (checkResult.length === 0) {
       console.error('خطأ صلاحيات الوصول:', checkResult);
       return res.status(403).json({ message: 'لا يسمح لك بالوصول لهذه الرسائل' });
@@ -1393,19 +1447,19 @@ app.post('/api/send-notification', verifyToken, async (req, res) => {
 
   const accessToken = await getAccessToken();
 
-for (const { token, userId } of tokens) {
-  const message = {
-    message: {
-      token,
-      notification: { title, body },
-      data: {
-        screen: 'notifications',
-        userId,
-        userType: targetType || 'user', // ← يعتمد على targetType المُرسل من الواجهة
-        senderType: 'super' // إضافة هذه المعلومة
+  for (const { token, userId } of tokens) {
+    const message = {
+      message: {
+        token,
+        notification: { title, body },
+        data: {
+          screen: 'notifications',
+          userId,
+          userType: targetType || 'user', // ← يعتمد على targetType المُرسل من الواجهة
+          senderType: 'super' // إضافة هذه المعلومة
+        }
       }
-    }
-  };
+    };
 
     try {
       await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
@@ -1617,12 +1671,12 @@ app.get('/api/property-tenants/:cleanedAddress/:adminId', verifyToken, async (re
   const sql = `
     SELECT 
       u.user_id AS tenant_id,
-      MAX(rcd.tenant_name) AS tenant_name,
-      MAX(rcd.tenant_phone) AS tenant_phone,
-      MAX(rcd.tenant_email) AS tenant_email,
-      MAX(rcd.unit_number) AS unit_number,
-      MAX(rcd.unit_floor_number) AS unit_floor_number,
-      MAX(rcd.unit_area) AS unit_area
+      rcd.tenant_name,
+      rcd.tenant_phone,
+      rcd.tenant_email,
+      rcd.unit_number,
+      rcd.unit_floor_number,
+      rcd.unit_area
     FROM rental_contracts_details rcd
     JOIN users u ON u.id = rcd.tenant_id
     WHERE rcd.admin_id = ?
@@ -1642,22 +1696,22 @@ app.get('/api/property-tenants/:cleanedAddress/:adminId', verifyToken, async (re
 });
 
 
-
 app.get('/api/tenants-by-admin/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
 
   const sql = `
     SELECT 
-      u.user_id AS tenant_id,
-      MAX(rcd.tenant_name) AS tenant_name,
-      MAX(rcd.tenant_phone) AS tenant_phone
-    FROM rental_contracts_details rcd
-    JOIN users u ON u.id = rcd.tenant_id
-    WHERE rcd.admin_id = ?
-      AND u.fcm_token IS NOT NULL
-      AND u.fcm_token != ''
-    GROUP BY u.user_id
-    ORDER BY tenant_name ASC;
+  u.user_id AS tenant_id,
+  MAX(rcd.tenant_name) AS tenant_name,
+  MAX(rcd.tenant_phone) AS tenant_phone
+FROM rental_contracts_details rcd
+JOIN users u ON u.id = rcd.tenant_id
+WHERE rcd.admin_id = ?
+  AND u.fcm_token IS NOT NULL
+  AND u.fcm_token != ''
+GROUP BY u.user_id
+ORDER BY tenant_name ASC;
+
   `;
 
   try {
@@ -1668,7 +1722,6 @@ app.get('/api/tenants-by-admin/:adminId', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'DB Error', error: err });
   }
 });
-
 
 
 // ✅ endpoint لإظهار الإشعارات التي أرسلها المالك للمستأجرين
@@ -1740,16 +1793,16 @@ app.post('/api/admin/send-notification', verifyToken, async (req, res) => {
 
 
   const [adminUser] = await query(
-  'SELECT notifications_sent FROM users WHERE id = ?',
-  [adminId]
-);
+    'SELECT notifications_sent FROM users WHERE id = ?',
+    [adminId]
+  );
 
-if (adminUser.notifications_sent >= 100) {
-  return res.status(403).json({
-    message: '⚠️ لقد استخدمت الحد المجاني (100 إشعار). يرجى الاشتراك لتفعيل المزيد.',
-  });
-}
- 
+  if (adminUser.notifications_sent >= 100) {
+    return res.status(403).json({
+      message: '⚠️ لقد استخدمت الحد المجاني (100 إشعار). يرجى الاشتراك لتفعيل المزيد.',
+    });
+  }
+
 
   let tokens = [];
 
@@ -1799,18 +1852,18 @@ if (adminUser.notifications_sent >= 100) {
   const accessToken = await getAccessToken();
 
   for (const { token, userId } of tokens) {
-   const message = {
-  message: {
-    token,
-    notification: { title, body },
-    data: {
-      screen: 'notifications',
-      userId,
-      userType: 'user',
-      senderType: 'admin'  // ✅ ضروري لإظهار صفحة المستأجر مش المالك
-    }
-  }
-};
+    const message = {
+      message: {
+        token,
+        notification: { title, body },
+        data: {
+          screen: 'notifications',
+          userId,
+          userType: 'user',
+          senderType: 'admin'  // ✅ ضروري لإظهار صفحة المستأجر مش المالك
+        }
+      }
+    };
 
 
     try {
@@ -1823,15 +1876,15 @@ if (adminUser.notifications_sent >= 100) {
         body: JSON.stringify(message),
       });
 
-    await query(`
+      await query(`
   INSERT INTO notifications (user_id, title, body, sender_id)
   VALUES (?, ?, ?, ?)
 `, [userId, title, body, adminId]);
 
-await query(
-  'UPDATE users SET notifications_sent = notifications_sent + 1 WHERE id = ?',
-  [adminId]
-);
+      await query(
+        'UPDATE users SET notifications_sent = notifications_sent + 1 WHERE id = ?',
+        [adminId]
+      );
 
     } catch (err) {
       console.error(`❌ فشل إرسال الإشعار لـ ${userId}:`, err);
@@ -1839,9 +1892,9 @@ await query(
   }
 
   res.json({
-  message: `✅ تم إرسال الإشعار إلى ${tokens.length} مستأجر`,
-  sender_id: adminId
-});
+    message: `✅ تم إرسال الإشعار إلى ${tokens.length} مستأجر`,
+    sender_id: adminId
+  });
 });
 
 app.get('/api/admin/late-payments-notifications/:adminId', verifyToken, async (req, res) => {
@@ -2724,7 +2777,7 @@ app.get('/api/admin-services/:adminId', verifyToken, async (req, res) => {
 // ✅ 5. Toggle service for admin
 app.post('/api/admin-services/toggle', verifyToken, async (req, res) => {
   const { userType } = req.user;
-  
+
   if (userType !== 'admin' && userType !== 'super') {
     return res.status(403).json({ message: 'غير مصرح' });
   }
@@ -2812,10 +2865,10 @@ app.get('/api/services-for-tenant/:tenantUserId', verifyToken, async (req, res) 
         case 7: route = 'waterDelivery'; break;
         case 8: route = 'paymentAlert'; break;
         case 9: route = 'supportContact'; break;
-        case 21: route = 'cleaningServiceRequest'; break;       
-        case 22: route = 'changeLocksRequest'; break;           
-        case 23: route = 'noiseComplaintRequest'; break;        
-        case 24: route = 'apartmentSuppliesRequest'; break;     
+        case 21: route = 'cleaningServiceRequest'; break;
+        case 22: route = 'changeLocksRequest'; break;
+        case 23: route = 'noiseComplaintRequest'; break;
+        case 24: route = 'apartmentSuppliesRequest'; break;
         default: route = null;
       }
 
@@ -3692,149 +3745,151 @@ app.post('/api/renew-contract', upload.single('pdf'), async (req, res) => {
 
   try {
     const tempPath = req.file.path;
-const gcsFileName = `${Date.now()}-${req.file.originalname}`;
+    const gcsFileName = `${Date.now()}-${req.file.originalname}`;
 
-await bucket.upload(tempPath, {
-  destination: gcsFileName,
-  resumable: false,
-  contentType: req.file.mimetype,
-  metadata: {
-    cacheControl: 'public, max-age=31536000',
-  },
-});
+    await bucket.upload(tempPath, {
+      destination: gcsFileName,
+      resumable: false,
+      contentType: req.file.mimetype,
+      metadata: {
+        cacheControl: 'public, max-age=31536000',
+      },
+    });
 
 
 
-const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
-const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
-const pdfData = await pdfParse(fileBuffer);   // ⬅️ تحليل الملف
-const text = pdfData.text;                    // ⬅️ النص اللي راح تستخدمه
-const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
-const toFloat = (v) => parseFloat(v) || 0;
-const toInt = (v) => parseInt(v) || 0;
-console.log('📄 Temp Path:', tempPath);
-console.log('📄 File Exists:', fs.existsSync(tempPath));
-console.log('📄 File Size:', fs.statSync(tempPath).size);
+    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+    const fileBuffer = fs.readFileSync(tempPath); // ⬅️ لتحليل المحتوى
+    const pdfData = await pdfParse(fileBuffer);   // ⬅️ تحليل الملف
+    const text = pdfData.text;                    // ⬅️ النص اللي راح تستخدمه
+    const extract = (regex) => (text.match(regex) || [])[1]?.trim() || '';
+    const toFloat = (v) => parseFloat(v) || 0;
+    const toInt = (v) => parseInt(v) || 0;
+    console.log('📄 Temp Path:', tempPath);
+    console.log('📄 File Exists:', fs.existsSync(tempPath));
+    console.log('📄 File Size:', fs.statSync(tempPath).size);
 
 
 
     const data = {
-  contract_number: extract(/Contract No\.(.+?):العقد سجل رقم/),
-  contract_type: extract(/Contract Type(.+?):العقد نوع/),
-  contract_date: extract(/Contract Sealing Date(\d{4}-\d{2}-\d{2})/),
-  contract_start: extract(/Tenancy Start Date(\d{4}-\d{2}-\d{2})/),
-  contract_end: extract(/Tenancy End Date(\d{4}-\d{2}-\d{2})/),
-  contract_location: extract(/Location\n(.+?):العقد إبرام مكان/),
+      contract_number: extract(/Contract No\.(.+?):العقد سجل رقم/),
+      contract_type: extract(/Contract Type(.+?):العقد نوع/),
+      contract_date: extract(/Contract Sealing Date(\d{4}-\d{2}-\d{2})/),
+      contract_start: extract(/Tenancy Start Date(\d{4}-\d{2}-\d{2})/),
+      contract_end: extract(/Tenancy End Date(\d{4}-\d{2}-\d{2})/),
+      contract_location: extract(/Location\n(.+?):العقد إبرام مكان/),
 
-  // Tenant Information
-  tenant_name: (() => {
-    let raw = '';
-    let match = text.match(/Name\s*الاسم:?\s*(.+)/);
-    if (match && match[1]) {
-      raw = match[1].trim();
-    } else {
-      match = text.match(/Tenant Data[\s\S]*?Name(.+?):الاسم/);
-      if (match && match[1]) raw = match[1].trim();
-    }
-    return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
-  })(),
+      // Tenant Information
+      tenant_name: (() => {
+        let raw = '';
+        let match = text.match(/Name\s*الاسم:?\s*(.+)/);
+        if (match && match[1]) {
+          raw = match[1].trim();
+        } else {
+          match = text.match(/Tenant Data[\s\S]*?Name(.+?):الاسم/);
+          if (match && match[1]) raw = match[1].trim();
+        }
+        return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
+      })(),
 
-  tenant_nationality: extract(/Tenant Data[\s\S]*?Nationality(.+?):الجنسي/),
-  tenant_id_type: (() => {
-    const raw = extract(/Tenant Data[\s\S]*?ID Type(.+?):الهوي/).trim();
-    return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
-  })(),
-  tenant_id_number: extract(/Tenant Data[\s\S]*?ID No\.(\d+):الهوي/),
-  tenant_email: extract(/Tenant Data[\s\S]*?Email(.+?):الإلكتروني البريد/) || '-',
-  tenant_phone: extract(/Tenant Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
-  tenant_address: (() => {
-    const raw = extract(/Tenant Data[\s\S]*?National Address(.+?):الوطني العنوان/).trim();
-    if (!raw) return '';
-    const parts = raw.split(/,\s*/);
-    return parts.map(part => part.split(/\s+/).reverse().join(' ')).reverse().join(', ');
-  })(),
+      tenant_nationality: extract(/Tenant Data[\s\S]*?Nationality(.+?):الجنسي/),
+      tenant_id_type: (() => {
+        const raw = extract(/Tenant Data[\s\S]*?ID Type(.+?):الهوي/).trim();
+        return !raw ? '' : raw.split(/\s+/).reverse().join(' ');
+      })(),
+      tenant_id_number: extract(/Tenant Data[\s\S]*?ID No\.(\d+):الهوي/),
+      tenant_email: extract(/Tenant Data[\s\S]*?Email(.+?):الإلكتروني البريد/) || '-',
+      tenant_phone: extract(/Tenant Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
+      tenant_address: (() => {
+        const raw = extract(/Tenant Data[\s\S]*?National Address(.+?):الوطني العنوان/).trim();
+        if (!raw) return '';
+        const parts = raw.split(/,\s*/);
+        return parts.map(part => part.split(/\s+/).reverse().join(' ')).reverse().join(', ');
+      })(),
 
-  // Owner Information
-  owner_name: extract(/Lessor Data[\s\S]*?Name(.+?):الاسم/).split(' ').reverse().join(' '),
-  owner_nationality: (() => {
-    const lines = text.split('\n');
-    const i = lines.findIndex(line => line.includes('Nationality'));
-    if (i !== -1 && lines[i + 1] && lines[i + 2]) {
-      const raw = `${lines[i + 1].trim()} ${lines[i + 2].trim()}`;
-      const words = raw.split(/\s+/);
-      if (words.includes('السعودية') && words.includes('العربية') && words.includes('المملكة')) {
-        return 'المملكة العربية السعودية';
-      }
-      return raw;
-    }
-    return (i !== -1 && lines[i + 1]) ? lines[i + 1].trim() : '';
-  })(),
-  owner_id_type: (() => {
-    const lines = text.split('\n');
-    const idx = lines.findIndex(line => line.includes('ID Type'));
-    let result = '';
-    if (idx !== -1) {
-      const line = lines[idx];
-      const match = line.match(/ID Type\s*([^\:]+):الهوي/);
-      if (match && match[1]) result = match[1].trim();
-      else {
-        const start = line.indexOf('ID Type') + 'ID Type'.length;
-        const end = line.indexOf(':الهوي');
-        if (end > start) result = line.substring(start, end).trim();
-      }
-    }
-    if (result) {
-      const words = result.split(/\s+/);
-      if (words.length === 2 && (words[0].endsWith('ية') || words[0].endsWith('يم'))) {
-        return `${words[1]} ${words[0]}`;
-      }
-    }
-    return result;
-  })(),
-  owner_id_number: extract(/Lessor Data[\s\S]*?ID No\.(\d+):الهوي/),
-  owner_email: extract(/Lessor Data[\s\S]*?Email(.+?):الإلكتروني البريد/),
-  owner_phone: extract(/Lessor Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
-  owner_address: (() => {
-    let addr = '';
-    const match = text.match(/National Address\s*:?([^\n:]+):الوطني العنوان/);
-    if (match && match[1]) addr = match[1].replace(/\s+/g, ' ').trim();
-    else {
-      const alt = text.match(/العنوان الوطني:\s*([^\n:]+)\s*Address National/);
-      if (alt && alt[1]) addr = alt[1].replace(/\s+/g, ' ').trim();
-    }
-    return addr.split(/\s+/).reverse().join(' ');
-  })(),
+      // Owner Information
+      owner_name: extract(/Lessor Data[\s\S]*?Name(.+?):الاسم/).split(' ').reverse().join(' '),
+      owner_nationality: (() => {
+        const lines = text.split('\n');
+        const i = lines.findIndex(line => line.includes('Nationality'));
+        if (i !== -1 && lines[i + 1] && lines[i + 2]) {
+          const raw = `${lines[i + 1].trim()} ${lines[i + 2].trim()}`;
+          const words = raw.split(/\s+/);
+          if (words.includes('السعودية') && words.includes('العربية') && words.includes('المملكة')) {
+            return 'المملكة العربية السعودية';
+          }
+          return raw;
+        }
+        return (i !== -1 && lines[i + 1]) ? lines[i + 1].trim() : '';
+      })(),
+      owner_id_type: (() => {
+        const lines = text.split('\n');
+        const idx = lines.findIndex(line => line.includes('ID Type'));
+        let result = '';
+        if (idx !== -1) {
+          const line = lines[idx];
+          const match = line.match(/ID Type\s*([^\:]+):الهوي/);
+          if (match && match[1]) result = match[1].trim();
+          else {
+            const start = line.indexOf('ID Type') + 'ID Type'.length;
+            const end = line.indexOf(':الهوي');
+            if (end > start) result = line.substring(start, end).trim();
+          }
+        }
+        if (result) {
+          const words = result.split(/\s+/);
+          if (words.length === 2 && (words[0].endsWith('ية') || words[0].endsWith('يم'))) {
+            return `${words[1]} ${words[0]}`;
+          }
+        }
+        return result;
+      })(),
+      owner_id_number: extract(/Lessor Data[\s\S]*?ID No\.(\d+):الهوي/),
+      owner_email: extract(/Lessor Data[\s\S]*?Email(.+?):الإلكتروني البريد/),
+      owner_phone: extract(/Lessor Data[\s\S]*?Mobile No\.(\+?\d+):الجو/),
+      owner_address: (() => {
+        let addr = '';
+        const match = text.match(/National Address\s*:?([^\n:]+):الوطني العنوان/);
+        if (match && match[1]) addr = match[1].replace(/\s+/g, ' ').trim();
+        else {
+          const alt = text.match(/العنوان الوطني:\s*([^\n:]+)\s*Address National/);
+          if (alt && alt[1]) addr = alt[1].replace(/\s+/g, ' ').trim();
+        }
+        return addr.split(/\s+/).reverse().join(' ');
+      })(),
 
-  // Financial Data
-  annual_rent: toFloat(extract(/Annual Rent\s*(\d+\.\d+)/)),
-  periodic_rent_payment: toFloat(extract(/Regular Rent Payment:\s*(\d+\.\d+)/)),
-  rent_payment_cycle: extract(/Rent payment cycle\s*(\S+)/).replace(/الايجار.*/, '').trim(),
-  rent_payments_count: toInt(extract(/Number of Rent\s*Payments:\s*(\d+)/)),
-  total_contract_value: toFloat(extract(/Total Contract value\s*(\d+\.\d+)/)),
+      // Financial Data
+      annual_rent: toFloat(extract(/Annual Rent\s*(\d+\.\d+)/)),
+      periodic_rent_payment: toFloat(extract(/Regular Rent Payment:\s*(\d+\.\d+)/)),
+      rent_payment_cycle: extract(/Rent payment cycle\s*(\S+)/).replace(/الايجار.*/, '').trim(),
+      rent_payments_count: toInt(extract(/Number of Rent\s*Payments:\s*(\d+)/)),
+      total_contract_value: toFloat(extract(/Total Contract value\s*(\d+\.\d+)/)),
 
-  // Property Information
-  property_usage: (() => {
-    const raw = extract(/Property Usage\s*(.+?)\s*استخدام/).trim();
-    return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
-  })(),
-  property_building_type: extract(/Property Type(.+?):العقار بناء نوع/),
-  property_units_count: toInt(extract(/Number of Units(\d+)/)),
-  property_floors_count: toInt(extract(/Number of Floors(\d+)/)),
-  property_national_address: extract(/Property Data[\s\S]*?National Address(.+?):الوطني العنوان/),
+      // Property Information
+      property_usage: (() => {
+        const raw = extract(/Property Usage\s*(.+?)\s*استخدام/).trim();
+        return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
+      })(),
+      property_building_type: extract(/Property Type(.+?):العقار بناء نوع/),
+      property_units_count: toInt(extract(/Number of Units(\d+)/)),
+      property_floors_count: toInt(extract(/Number of Floors(\d+)/)),
+      property_national_address: extract(/Property Data[\s\S]*?National Address(.+?):الوطني العنوان/),
 
-  // Unit Information
-  unit_type: extract(/Unit Type(.+?):الوحدة نوع/),
-  unit_number: extract(/Unit No\.(.+?):الوحدة رقم/),
-  unit_floor_number: toInt(extract(/Floor No\.(\d+):الطابق رقم/)),
-  unit_area: toFloat(extract(/Unit Area(\d+\.\d+):الوحدة مساحة/)),
-  unit_furnishing_status: extract(/Furnishing Status\s*[-:]?\s*(.*?)\s*Number of AC units/),
-  unit_ac_units_count: toInt(extract(/Number of AC units(\d+)/)),
-  unit_ac_type: (() => {
-    const raw = extract(/AC Type(.+?)التكييف نوع/).trim();
-    return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
-  })(),
+      // Unit Information
+      unit_type: extract(/Unit Type(.+?):الوحدة نوع/),
+      unit_number: extract(/Unit No\.(.+?):الوحدة رقم/),
+      unit_floor_number: toInt(extract(/Floor No\.(\d+):الطابق رقم/)),
+      unit_area: toFloat(extract(/Unit Area(\d+\.\d+):الوحدة مساحة/)),
+      unit_furnishing_status: extract(/Furnishing Status\s*[-:]?\s*(.*?)\s*Number of AC units/),
+      unit_ac_units_count: toInt(extract(/Number of AC units(\d+)/)),
+      unit_ac_type: (() => {
+        const raw = extract(/AC Type(.+?)التكييف نوع/).trim();
+        return !raw ? '' : raw.split(/,\s*/).map(part => part.split(/\s+/).reverse().join(' ')).join(', ');
+      })(),
 
-  pdf_path: publicUrl,
+
+
+      pdf_path: publicUrl,
       tenant_id: null, // بنعبيها بعدين
       admin_id: admin_id
     };
@@ -3891,30 +3946,30 @@ console.log('📄 File Size:', fs.statSync(tempPath).size);
   SELECT tenant_id FROM rental_contracts_details WHERE id = ?
 `, [contractId]);
 
-if (!existingContract || !existingContract.tenant_id) {
-  return res.status(400).json({ message: 'لم يتم العثور على معرف المستأجر للعقد القديم.' });
-}
+    if (!existingContract || !existingContract.tenant_id) {
+      return res.status(400).json({ message: 'لم يتم العثور على معرف المستأجر للعقد القديم.' });
+    }
 
-data.tenant_id = existingContract.tenant_id;
+    data.tenant_id = existingContract.tenant_id;
 
     await query(archiveSql, [contractId]);
 
     // تحديث العقد الجديد
- const updateFields = Object.keys(data)
-  .filter(key => key !== 'tenant_id') // مستبعد tenant_id
-  .map(key => `${key}=?`).join(', ');
+    const updateFields = Object.keys(data)
+      .filter(key => key !== 'tenant_id') // مستبعد tenant_id
+      .map(key => `${key}=?`).join(', ');
 
-const updateValues = Object.keys(data)
-  .filter(key => key !== 'tenant_id')
-  .map(key => data[key]);
+    const updateValues = Object.keys(data)
+      .filter(key => key !== 'tenant_id')
+      .map(key => data[key]);
 
-updateValues.push(contractId);  // إضافة شرط الـ WHERE في نهاية المصفوفة
+    updateValues.push(contractId);  // إضافة شرط الـ WHERE في نهاية المصفوفة
 
-const updateSql = `
+    const updateSql = `
   UPDATE rental_contracts_details SET ${updateFields} WHERE id=?
 `;
 
-await query(updateSql, updateValues);
+    await query(updateSql, updateValues);
 
     res.json({
       message: '✅ تم تجديد العقد بنجاح وأرشفة النسخة القديمة.',
@@ -3960,7 +4015,7 @@ app.get('/api/contracts-archive/:archiveId', verifyToken, async (req, res) => {
   `;
 
   try {
-    
+
     const [contract] = await query(sql, [archiveId]);
 
     if (!contract) {
