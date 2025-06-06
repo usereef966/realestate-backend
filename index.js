@@ -1208,6 +1208,25 @@ app.post('/api/messages/send', verifyToken, async (req, res) => {
 });
 
 
+// تعليم كل رسائل الطرف الآخر كمقروء في غرفة الشات
+app.put('/api/messages/:chatRoomId/read', verifyToken, async (req, res) => {
+  const { chatRoomId } = req.params;
+  const userId = req.user.userId; // النصي
+  const userDbId = req.user.id;   // الرقمي
+
+  try {
+    // علم كل الرسائل التي استقبلها المستخدم الحالي في هذه الغرفة كمقروء (نصي أو رقمي)
+    const result = await query(
+      `UPDATE messages SET is_read = 1 
+       WHERE chat_room_id = ? AND (receiver_id = ? OR receiver_id = ?) AND is_read = 0`,
+      [chatRoomId, userId, userDbId]
+    );
+    res.json({ message: 'تم التعليم كمقروء', affectedRows: result.affectedRows });
+  } catch (err) {
+    res.status(500).json({ message: 'خطأ', error: err });
+  }
+});
+
 
 app.get('/api/messages/:chatRoomId', verifyToken, async (req, res) => {
   const { chatRoomId } = req.params;
@@ -1500,6 +1519,111 @@ app.post('/api/send-notification', verifyToken, async (req, res) => {
 });
 
 
+app.get('/api/user/all-notifications/:userId', verifyToken, async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    // إشعارات عامة
+    const notifications = await query(
+      `SELECT id, title, body, is_read, created_at, 'notification' as type
+       FROM notifications WHERE user_id = ?`,
+      [userId]
+    );
+
+    // إشعارات الصيانة
+    const maintenance = await query(
+      `SELECT id, category as title, description as body, is_read, created_at, 'maintenance' as type
+       FROM maintenance_requests WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)`,
+      [userId]
+    );
+
+    // إشعارات الإزعاج (تأكد أن جدول noise_complaints فيه عمود is_read)
+    const noise = await query(
+      `SELECT id, category as title, description as body, is_read, created_at, 'noise' as type
+       FROM noise_complaints WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)`,
+      [userId]
+    );
+
+    // إشعارات الدفعات المتأخرة
+    const latePayments = await query(
+      `SELECT 
+        id, 
+        'تنبيه دفعة متأخرة' as title, 
+        CONCAT('لديك دفعة متأخرة، يرجى مراجعة تفاصيل الدفع.') as body, 
+        is_read, 
+        last_sent_date as created_at, 
+        'late_payment' as type
+       FROM late_payment_notifications
+       WHERE tenant_id = (SELECT id FROM users WHERE user_id = ?)
+       ORDER BY last_sent_date DESC`,
+      [userId]
+    );
+
+    // إشعارات الشات (آخر رسالة غير مقروءة لكل غرفة)
+    const chat = await query(
+      `SELECT 
+        m.id, 
+        'رسالة جديدة في الدردشة' as title, 
+        m.message as body, 
+        m.is_read, 
+        m.timestamp as created_at, 
+        'chat' as type,
+        m.chat_room_id as chatRoomId,
+        m.receiver_id as userId,
+        m.sender_id as otherUserId,
+        u2.name as otherUserName
+      FROM messages m
+      JOIN chat_rooms cr ON m.chat_room_id = cr.id
+      JOIN users u1 ON m.receiver_id = u1.user_id OR m.receiver_id = u1.id
+      JOIN users u2 ON m.sender_id = u2.user_id OR m.sender_id = u2.id
+      WHERE (u1.user_id = ? OR u1.id = ?) AND m.receiver_id = u1.user_id AND m.is_read = 0
+      ORDER BY m.timestamp DESC`,
+      [userId, userId]
+    );
+
+    // دمج وترتيب حسب التاريخ
+    const all = [
+      ...notifications,
+      ...maintenance,
+      ...noise,
+      ...latePayments,
+      ...chat
+    ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    res.json({ notifications: all });
+  } catch (err) {
+    console.error('❌ All-Notifications Error:', err);
+    res.status(500).json({ message: 'خطأ داخلي في جلب الإشعارات', error: err });
+  }
+});
+
+
+app.put('/api/late-payment-notifications/:id/read', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { userId } = req.user;
+
+  // تحقق أن الإشعار يخص المستخدم
+  const checkSql = 'SELECT tenant_id FROM late_payment_notifications WHERE id = ?';
+  const updateSql = 'UPDATE late_payment_notifications SET is_read = TRUE WHERE id = ?';
+
+  try {
+    const results = await query(checkSql, [id]);
+    if (results.length === 0) {
+      return res.status(404).json({ message: 'الإشعار غير موجود' });
+    }
+    // تحقق من ملكية الإشعار
+    const tenantId = results[0].tenant_id;
+    const userRow = await query('SELECT id FROM users WHERE user_id = ?', [userId]);
+    if (!userRow.length || userRow[0].id !== tenantId) {
+      return res.status(403).json({ message: 'لا يمكنك تعديل هذا الإشعار' });
+    }
+    await query(updateSql, [id]);
+    res.json({ message: 'تم التعليم كمقروء' });
+  } catch (err) {
+    res.status(500).json({ message: 'خطأ في التعليم كمقروء', error: err });
+  }
+});
+
 
 
 
@@ -1772,18 +1896,60 @@ app.get('/api/admin-sent-notifications/:adminId', verifyToken, async (req, res) 
 app.get('/api/admin-received-notifications/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
 
-  const sql = `
-    SELECT id, title, body, created_at, is_read
-    FROM notifications
-    WHERE user_id = ? AND sender_id IS NULL
-    ORDER BY created_at DESC
-  `;
-
   try {
-    const rows = await query(sql, [adminId]);
-    res.json({ notifications: rows });
+    // إشعارات عامة لكل مستأجر مرتبط بالمالك
+    const notifications = await query(
+      `SELECT n.id, n.title, n.body, n.is_read, n.created_at, u.name as tenantName, 'notification' as type
+       FROM notifications n
+       JOIN users u ON n.user_id = u.user_id
+       JOIN rental_contracts_details rcd ON u.id = rcd.tenant_id
+       WHERE rcd.admin_id = ?
+       GROUP BY n.id
+       ORDER BY n.created_at DESC`,
+      [adminId]
+    );
+
+    // إشعارات الصيانة
+    const maintenance = await query(
+      `SELECT m.id, CONCAT('طلب صيانة من ', u.name) as title, m.description as body, m.is_read, m.created_at, u.name as tenantName, 'maintenance' as type
+       FROM maintenance_requests m
+       JOIN users u ON m.tenant_id = u.id
+       WHERE m.owner_id = ?
+       ORDER BY m.created_at DESC`,
+      [adminId]
+    );
+    // إشعارات الإزعاج
+    const noise = await query(
+      `SELECT n.id, CONCAT('بلاغ إزعاج من ', u.name) as title, n.description as body, n.is_read, n.created_at, u.name as tenantName, 'noise' as type
+       FROM noise_complaints n
+       JOIN users u ON n.tenant_id = u.id
+       WHERE n.admin_id = ?
+       ORDER BY n.created_at DESC`,
+      [adminId]
+    );
+
+    // إشعارات الدفعات المتأخرة
+    const latePayments = await query(
+      `SELECT l.id, 'تنبيه دفعة متأخرة' as title, CONCAT('لدى المستأجر ', u.name, ' دفعة متأخرة.') as body, l.is_read, l.last_sent_date as created_at, u.name as tenantName, 'late_payment' as type
+       FROM late_payment_notifications l
+       JOIN users u ON l.tenant_id = u.id
+       WHERE l.admin_id = ?
+       ORDER BY l.last_sent_date DESC`,
+      [adminId]
+    );
+
+    // دمج وترتيب حسب التاريخ
+    const all = [
+      ...notifications,
+      ...maintenance,
+      ...noise,
+      ...latePayments
+    ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    res.json({ notifications: all });
   } catch (err) {
-    res.status(500).json({ message: 'DB Error', error: err });
+    console.error('❌ Admin notifications error:', err);
+    res.status(500).json({ message: 'خطأ في جلب إشعارات المالك', error: err });
   }
 });
 
@@ -2026,10 +2192,10 @@ app.post('/api/admin/send-late-payment-notification', verifyToken, async (req, r
 
     // تسجيل تاريخ إرسال الإشعار في قاعدة البيانات (حتى لو لم يوجد FCM)
     await query(`
-      INSERT INTO late_payment_notifications (admin_id, tenant_id, last_sent_date)
-      VALUES (?, ?, CURDATE())
-      ON DUPLICATE KEY UPDATE last_sent_date = CURDATE()
-    `, [adminId, tenantDbId]);
+  INSERT INTO late_payment_notifications (admin_id, tenant_id, last_sent_date, is_read)
+  VALUES (?, ?, CURDATE(), 0)
+  ON DUPLICATE KEY UPDATE last_sent_date = CURDATE(), is_read = 0
+`, [adminId, tenantDbId]);
 
     // رسالة واضحة للمالك
     let clientMsg = '';
@@ -2152,7 +2318,78 @@ app.get('/api/admin/get-default-late-notification/:adminId', verifyToken, async 
 
 
 
+app.put('/api/maintenance-requests/:id/read', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { userType, id: userId } = req.user;
 
+  try {
+    // جلب الطلب
+    const [request] = await query('SELECT tenant_id, owner_id FROM maintenance_requests WHERE id = ?', [id]);
+    if (!request) return res.status(404).json({ message: 'غير موجود' });
+
+    // فقط المستأجر أو المالك المرتبط يحق له التعليم كمقروء
+    if (userType === 'user') {
+      const [userRow] = await query('SELECT id FROM users WHERE user_id = ?', [req.user.userId]);
+      if (!userRow || userRow.id !== request.tenant_id)
+        return res.status(403).json({ message: 'غير مصرح' });
+    } else if (userType === 'admin') {
+      if (userId !== request.owner_id)
+        return res.status(403).json({ message: 'غير مصرح' });
+    } else {
+      return res.status(403).json({ message: 'غير مصرح' });
+    }
+
+    await query('UPDATE maintenance_requests SET is_read = 1 WHERE id = ?', [id]);
+    res.json({ message: 'تم التعليم كمقروء' });
+  } catch (err) {
+    res.status(500).json({ message: 'خطأ', error: err });
+  }
+});
+
+
+app.put('/api/noise-complaints/:id/read', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { userType, id: userId } = req.user;
+
+  try {
+    const [complaint] = await query('SELECT tenant_id, admin_id FROM noise_complaints WHERE id = ?', [id]);
+    if (!complaint) return res.status(404).json({ message: 'غير موجود' });
+
+    // فقط المستأجر أو المالك المرتبط يحق له التعليم كمقروء
+    if (userType === 'user') {
+      const [userRow] = await query('SELECT id FROM users WHERE user_id = ?', [req.user.userId]);
+      if (!userRow || userRow.id !== complaint.tenant_id)
+        return res.status(403).json({ message: 'غير مصرح' });
+    } else if (userType === 'admin') {
+      if (userId !== complaint.admin_id)
+        return res.status(403).json({ message: 'غير مصرح' });
+    } else {
+      return res.status(403).json({ message: 'غير مصرح' });
+    }
+
+    await query('UPDATE noise_complaints SET is_read = 1 WHERE id = ?', [id]);
+    res.json({ message: 'تم التعليم كمقروء' });
+  } catch (err) {
+    res.status(500).json({ message: 'خطأ', error: err });
+  }
+});
+
+
+app.put('/api/messages/:id/read', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { userId } = req.user;
+  try {
+    // تحقق أن المستخدم هو المستقبل
+    const check = await query('SELECT receiver_id FROM messages WHERE id = ?', [id]);
+    if (!check.length) return res.status(404).json({ message: 'غير موجود' });
+    if (check[0].receiver_id != userId)
+      return res.status(403).json({ message: 'غير مصرح' });
+    await query('UPDATE messages SET is_read = 1 WHERE id = ?', [id]);
+    res.json({ message: 'تم التعليم كمقروء' });
+  } catch (err) {
+    res.status(500).json({ message: 'خطأ', error: err });
+  }
+});
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
