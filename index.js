@@ -323,10 +323,10 @@ app.post('/api/generate-admin-token', verifyToken, async (req, res) => {
 
   const token = Math.floor(10000000 + Math.random() * 90000000).toString(); // ⬅️ توكن 8 أرقام
 
-
   const sql = `
     INSERT INTO admin_tokens (token, permissions, created_by)
     VALUES (?, ?, ?)
+    ON DUPLICATE KEY UPDATE token = VALUES(token), permissions = VALUES(permissions)
   `;
 
   try {
