@@ -1600,9 +1600,9 @@ app.get('/api/user/all-notifications/:userId', verifyToken, async (req, res) => 
 
 app.put('/api/late-payment-notifications/:id/read', verifyToken, async (req, res) => {
   const { id } = req.params;
-  const { userId } = req.user;
+  const { userId, id: userDbId } = req.user;
 
-  // تحقق أن الإشعار يخص المستخدم
+  // تحقق أن الإشعار يخص المستخدم (يدعم id الرقمي أو user_id النصي)
   const checkSql = 'SELECT tenant_id FROM late_payment_notifications WHERE id = ?';
   const updateSql = 'UPDATE late_payment_notifications SET is_read = TRUE WHERE id = ?';
 
@@ -1611,12 +1611,17 @@ app.put('/api/late-payment-notifications/:id/read', verifyToken, async (req, res
     if (results.length === 0) {
       return res.status(404).json({ message: 'الإشعار غير موجود' });
     }
-    // تحقق من ملكية الإشعار
     const tenantId = results[0].tenant_id;
-    const userRow = await query('SELECT id FROM users WHERE user_id = ?', [userId]);
-    if (!userRow.length || userRow[0].id !== tenantId) {
+
+    // جلب بيانات المستخدم
+    const userRow = await query('SELECT id, user_id FROM users WHERE user_id = ? OR id = ?', [userId, tenantId]);
+    if (
+      !userRow.length ||
+      (userRow[0].id != tenantId && userRow[0].user_id != tenantId)
+    ) {
       return res.status(403).json({ message: 'لا يمكنك تعديل هذا الإشعار' });
     }
+
     await query(updateSql, [id]);
     res.json({ message: 'تم التعليم كمقروء' });
   } catch (err) {
