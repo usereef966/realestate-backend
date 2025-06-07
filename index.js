@@ -17,6 +17,35 @@ app.use(express.json());
 app.use(cors());
 
 
+
+
+function formatInternationalPhoneNumber(phone) {
+  phone = phone.replace(/\D/g, '').trim();
+
+  // Saudi Arabia
+  if ((phone.startsWith('05') && phone.length === 10) ||
+      (phone.startsWith('9665') && phone.length === 12) ||
+      (phone.startsWith('5') && phone.length === 9)) {
+    return '+966' + phone.slice(-9);
+  }
+
+  // Turkey
+  if ((phone.startsWith('05') && phone.length === 11) ||
+      (phone.startsWith('905') && phone.length === 12) ||
+      (phone.startsWith('5') && phone.length === 10)) {
+    return '+90' + phone.slice(-10);
+  }
+
+  // Already correct international format
+  if ((phone.startsWith('+966') && phone.length === 13) ||
+      (phone.startsWith('+90') && phone.length === 13)) {
+    return phone;
+  }
+
+  throw new Error('صيغة رقم الهاتف غير صحيحة: ' + phone);
+}
+
+
 // اتصال Pool يدير الاتصال تلقائيًا
 
 
@@ -358,6 +387,8 @@ app.post('/api/generate-user-token', verifyToken, async (req, res) => {
     res.status(500).json({ error: 'فشل في إنشاء توكن المستأجر' });
   }
 });
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -451,11 +482,36 @@ app.post('/api/create-tenant', verifyToken, async (req, res) => {
   }
 });
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+const axios = require('axios');
+
+const instance_id = 'instance124299';
+const token = 'hk7g25xetv3t58r5';
+
+async function sendWhatsAppMessage(to, message) {
+  try {
+    const response = await axios.post(`https://api.ultramsg.com/${instance_id}/messages/chat`, {
+      token: token,
+      to: to,
+      body: message
+    });
+
+    console.log('✅ WhatsApp sent:', response.data);
+    return response.data;
+  } catch (error) {
+    console.error('❌ WhatsApp sending error:', error);
+    throw error;
+  }
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 const multer = require('multer');
 const { Storage } = require('@google-cloud/storage');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+
 
 const upload = multer({ dest: os.tmpdir() }); // التخزين المؤقت
 
@@ -652,39 +708,81 @@ app.post('/api/analyze-local-pdf', upload.single('pdf'), async (req, res) => {
     try {
       const existing = await query(userCheckSql, [user_id]);
 
-      if (existing.length === 0) {
-        token = Math.floor(10000000 + Math.random() * 90000000).toString();
-        const insertUserSql = `
-      INSERT INTO users (user_id, name, user_type, token, created_at, created_by)
-      VALUES (?, ?, 'user', ?, NOW(), ?)
-    `;
-        const userResult = await query(insertUserSql, [
-          user_id,
-          tenant_name_from_pdf,
-          token,
-          admin_id
-        ]);
-        tenantDbId = userResult.insertId;
-        createdTenant = true;
+  
 
-        const insertTokenSql = `
-      INSERT INTO user_tokens (token, permissions, created_by)
-      VALUES (?, ?, ?)
-    `;
-        await query(insertTokenSql, [token, '{}', admin_id]);
-        createdToken = true;
-      } else {
-        // ✅ هنا يتم منع الإدخال لأن المستأجر موجود مسبقًا
-        return res.status(400).json({
-          message: '❌ هذا المستأجر مسجّل بالفعل برقم الهوية نفسه ولا يمكن إضافته مرة أخرى.'
-        });
-      }
-      data.tenant_id = tenantDbId;
+// ✅ عرّف الدالة بشكل واضح أولًا في الأعلى
 
-    } catch (err) {
-      console.error('❌ User Creation Error:', err);
-      return res.status(500).json({ message: 'فشل في إنشاء أو التحقق من المستأجر' });
-    }
+
+// ✅ ثم بقية الكود بشكل واضح ومنظم
+if (existing.length === 0) {
+  token = Math.floor(10000000 + Math.random() * 90000000).toString();
+
+  let formattedPhone;
+
+  try {
+    formattedPhone = formatInternationalPhoneNumber(data.tenant_phone);
+  } catch (err) {
+    console.error('⚠️ خطأ في صيغة رقم الهاتف:', err.message);
+    formattedPhone = null;
+  }
+
+  const insertUserSql = `
+    INSERT INTO users (user_id, name, user_type, token, phone_number, created_at, created_by)
+    VALUES (?, ?, 'user', ?, ?, NOW(), ?)
+  `;
+
+  const userResult = await query(insertUserSql, [
+    user_id,
+    tenant_name_from_pdf,
+    token,
+    formattedPhone,
+    admin_id
+  ]);
+
+  tenantDbId = userResult.insertId;
+  createdTenant = true;
+
+  const insertTokenSql = `
+    INSERT INTO user_tokens (token, permissions, created_by)
+    VALUES (?, ?, ?)
+  `;
+  await query(insertTokenSql, [token, '{}', admin_id]);
+  createdToken = true;
+
+  // ✅ رسالة واتساب ذكية وواضحة
+  const welcomeMessage = `
+مرحبًا ${tenant_name_from_pdf || 'عميلنا العزيز'} 👋،
+
+تم إنشاء حسابك بنجاح 🎉
+
+${user_id ? `رقم الهوية: ${user_id}` : ''}
+${token ? `رمز الدخول: ${token}` : ''}
+
+مرحبًا بك في منصتنا!
+`.trim();
+
+  // ✅ إرسال الرسالة فقط في حال توفر الرقم الصحيح
+  if (formattedPhone) {
+    sendWhatsAppMessage(formattedPhone, welcomeMessage)
+      .then(() => console.log('✅ تم إرسال بيانات المستأجر عبر واتساب بنجاح'))
+      .catch((err) => console.error('❌ خطأ في إرسال واتساب:', err));
+  } else {
+    console.warn('⚠️ لم يتم إرسال رسالة واتساب بسبب رقم الهاتف غير متوفر أو غير صحيح.');
+  }
+
+} else {
+  return res.status(400).json({
+    message: '❌ هذا المستأجر مسجّل بالفعل برقم الهوية نفسه ولا يمكن إضافته مرة أخرى.'
+  });
+}
+
+data.tenant_id = tenantDbId;
+
+} catch (err) {
+  console.error('❌ User Creation Error:', err);
+  return res.status(500).json({ message: 'فشل في إنشاء أو التحقق من المستأجر' });
+}
+
 
 
 
@@ -891,6 +989,13 @@ app.post('/api/analyze-local-pdf', upload.single('pdf'), async (req, res) => {
     });
   }
 });
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 app.get('/api/download-contract/:tenantId', verifyToken, async (req, res) => {
@@ -1419,9 +1524,16 @@ app.post('/api/chat/send-notification', verifyToken, async (req, res) => {
 // 📁 index.js أو ملف routes المناسب
 // 📁 index.js أو ملف routes المناسب
 const { JWT } = require('google-auth-library');
+const admin = require('firebase-admin');
+
 const serviceAccount = JSON.parse(process.env.GOOGLE_CREDENTIALS);
 
-// دالة لجلب التوكن من Google
+// ✅ تهيئة Firebase Admin SDK للتحقق من OTP
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+// ✅ كود JWT الحالي لإرسال FCM
 async function getAccessToken() {
   const jwtClient = new JWT(
     serviceAccount.client_email,
@@ -1433,6 +1545,7 @@ async function getAccessToken() {
   const tokens = await jwtClient.authorize();
   return tokens.access_token;
 }
+
 
 // ✅ API لإرسال إشعار عبر FCM V1
 app.post('/api/send-notification', verifyToken, async (req, res) => {
@@ -4350,6 +4463,77 @@ app.get('/api/tenants-expiring/:adminId', verifyToken, async (req, res) => {
   }
 });
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// يجب أن يكون Firebase Admin SDK مُعد مسبقًا على backend
+
+app.post('/api/verify-phone-login', async (req, res) => {
+  const { idToken, phone_number } = req.body;
+
+  if (!idToken || !phone_number) {
+    return res.status(400).json({ message: 'بيانات الإدخال مطلوبة.' });
+  }
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const firebasePhone = decodedToken.phone_number;
+    const formattedPhone = formatInternationalPhoneNumber(phone_number);
+
+    if (firebasePhone !== formattedPhone) {
+      return res.status(401).json({ message: '❌ الرقم غير مطابق لما تم التحقق منه.' });
+    }
+
+    const [user] = await query(
+      'SELECT id, user_id, name, user_type FROM users WHERE phone_number = ? LIMIT 1', 
+      [formattedPhone]
+    );
+
+    if (!user || !user.user_id || !user.name || !user.user_type) {
+      return res.status(500).json({ message: '❌ بيانات المستخدم ناقصة أو غير صحيحة.' });
+    }
+
+    return sendLoginSuccess(res, user);
+
+  } catch (err) {
+    console.error('خطأ في التحقق من رقم الجوال:', err);
+    res.status(500).json({ message: 'حدث خطأ داخلي.' });
+  }
+});
+
+
+
+
+
+app.post('/api/check-phone-registered', async (req, res) => {
+  const { phone_number } = req.body;
+
+  if (!phone_number) {
+    return res.status(400).json({ message: 'رقم الجوال مطلوب.' });
+  }
+
+  let formattedPhone;
+
+  try {
+    formattedPhone = formatInternationalPhoneNumber(phone_number);
+  } catch (err) {
+    return res.status(400).json({ message: '❌ صيغة رقم الجوال غير صحيحة.' });
+  }
+
+  try {
+    const [user] = await query('SELECT id FROM users WHERE phone_number = ? LIMIT 1', [formattedPhone]);
+
+    if (!user) {
+      return res.status(404).json({ message: '❌ رقم الجوال غير مسجل.' });
+    }
+
+    res.json({ message: '✅ الرقم مسجل، يمكنك طلب OTP الآن.' });
+
+  } catch (err) {
+    console.error('خطأ في التحقق من رقم الجوال:', err);
+    res.status(500).json({ message: 'حدث خطأ داخلي.' });
+  }
+});
 
 
 
