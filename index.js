@@ -710,11 +710,7 @@ WHERE rcd.admin_id = ? AND rcd.contract_end >= CURDATE()
 `,
       [superAdminId]
     );
-  
 
-
-
-    
     // جلب آخر القيم من جدول super_stats_cache
     let [cache] = await query(
       'SELECT * FROM super_stats_cache WHERE super_id = ?',
@@ -4294,17 +4290,27 @@ app.post('/api/reviews/add', verifyToken, async (req, res) => {
 
 
 // ✅ API: جلب التقييمات (للموقع أو للمالك لو عنده صلاحية)
-app.get('/api/reviews/:adminId', verifyToken, async (req, res) => {
+app.get('/api/reviews-summary/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
 
   const permissionSql = `
     SELECT enabled FROM review_permissions WHERE admin_id = ?
   `;
 
-  const reviewsSql = `
-    SELECT rating, comment, created_at FROM reviews 
+  const statsSql = `
+    SELECT 
+      COUNT(*) AS total_reviews,
+      AVG(rating) AS average_rating
+    FROM reviews
+    WHERE visible = TRUE
+  `;
+
+  const recentReviewsSql = `
+    SELECT rating, comment, created_at 
+    FROM reviews 
     WHERE visible = TRUE 
     ORDER BY created_at DESC
+    LIMIT 2
   `;
 
   try {
@@ -4314,14 +4320,21 @@ app.get('/api/reviews/:adminId', verifyToken, async (req, res) => {
       return res.status(403).json({ message: '❌ لا يملك المالك صلاحية عرض التقييمات' });
     }
 
-    const reviews = await query(reviewsSql);
-    res.json({ reviews });
+    const stats = await query(statsSql);
+    const recentReviews = await query(recentReviewsSql);
+
+    res.json({
+      total_reviews: stats[0].total_reviews,
+      average_rating: parseFloat(stats[0].average_rating).toFixed(2),
+      recent_reviews: recentReviews
+    });
 
   } catch (err) {
-    console.error('❌ Fetch-reviews Error:', err);
-    res.status(500).json({ message: 'فشل في جلب التقييمات' });
+    console.error('❌ Reviews-summary Error:', err);
+    res.status(500).json({ message: 'فشل في جلب بيانات التقييمات' });
   }
 });
+
 // ✅ API: جلب تقييمات المستخدمين (للمستخدم نفسه)
 
 
@@ -5195,10 +5208,12 @@ app.get('/api/admin-finance-summary/:adminId', verifyToken, async (req, res) => 
 
   const paymentsSumSql = `
     SELECT 
-      IFNULL(SUM(p.payment_amount), 0) AS total_paid
-    FROM payments p
-    JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
-    WHERE rcd.admin_id = ? AND p.payment_status = 'مدفوعة' AND rcd.contract_end > CURDATE()
+  IFNULL(SUM(p.paid_amount), 0) AS total_paid
+FROM payments p
+JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+WHERE rcd.admin_id = ? 
+  AND p.payment_status IN ('مدفوعة', 'مدفوعة جزئياً') 
+  AND rcd.contract_end > CURDATE()
   `;
 
   try {
@@ -5303,16 +5318,16 @@ app.get('/api/admin-contracts-finance/:adminId', verifyToken, async (req, res) =
 
   const sql = `
     SELECT 
-      rcd.contract_number,
-      rcd.tenant_name,
-      rcd.total_contract_value,
-      IFNULL(SUM(p.payment_amount), 0) AS paid,
-      (rcd.total_contract_value - IFNULL(SUM(p.payment_amount), 0)) AS remaining
-    FROM rental_contracts_details rcd
-    LEFT JOIN payments p ON p.contract_id = rcd.id AND p.payment_status = 'مدفوعة'
-    WHERE rcd.admin_id = ? AND rcd.contract_end > CURDATE()
-    GROUP BY rcd.id
-    ORDER BY rcd.contract_start DESC
+  rcd.contract_number,
+  rcd.tenant_name,
+  rcd.total_contract_value,
+  IFNULL(SUM(p.paid_amount), 0) AS paid,
+  (rcd.total_contract_value - IFNULL(SUM(p.paid_amount), 0)) AS remaining
+FROM rental_contracts_details rcd
+LEFT JOIN payments p ON p.contract_id = rcd.id AND p.payment_status IN ('مدفوعة', 'مدفوعة جزئياً')
+WHERE rcd.admin_id = ? AND rcd.contract_end > CURDATE()
+GROUP BY rcd.id
+ORDER BY rcd.contract_start DESC
   `;
 
   try {
@@ -5354,14 +5369,20 @@ app.get('/api/admin-expiring-contracts/:adminId', verifyToken, async (req, res) 
 
 
 
-
 app.get('/api/admin-arrears/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
 
   const sql = `
     SELECT 
-      p.payment_number, p.payment_amount, p.due_date, p.payment_status,
-      rcd.contract_number, rcd.tenant_name
+      p.id, -- أضف هذا السطر
+      p.payment_number, 
+      p.payment_amount, 
+      p.due_date, 
+      p.remaining_amount,
+      p.payment_status,
+      rcd.contract_number, 
+      rcd.tenant_name,
+      rcd.tenant_id  -- ✅ تأكد من هذا العمود
     FROM payments p
     JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
     WHERE rcd.admin_id = ? 
@@ -5374,12 +5395,12 @@ app.get('/api/admin-arrears/:adminId', verifyToken, async (req, res) => {
   try {
     const arrears = await query(sql, [adminId]);
     res.json({ arrears });
-
   } catch (err) {
     console.error('❌ Admin-arrears Error:', err);
     res.status(500).json({ message: 'DB Error', error: err });
   }
 });
+
 
 
 
@@ -6085,89 +6106,109 @@ app.get('/api/articles/:id/stats', verifyToken, async (req, res) => {
   }
 });
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+app.post('/api/admin/update-payment-status', verifyToken, async (req, res) => {
+  const { payment_id, paid_amount, paid_date, reminder_date } = req.body;
 
-app.post('/api/twilio/sms-webhook', express.urlencoded({ extended: false }), async (req, res) => {
-  const messageBody = req.body.Body;
-
-  console.log('📩 SMS Received:', messageBody);
-
-  const extract = (regex, text) => (text.match(regex) || [])[1]?.trim() || '';
-
-  const contractNumber = extract(/للعقد رقم (\d+)/, messageBody);
-  const amountPaidRaw = extract(/بقيمة ([\d,]+\.\d{2}) ريال/, messageBody);
-
-  console.log('🔍 Extracted contractNumber:', contractNumber);
-  console.log('🔍 Extracted amountPaidRaw:', amountPaidRaw);
-
-  const amountPaid = parseFloat(amountPaidRaw.replace(/,/g, ''));
-
-  if (!contractNumber || isNaN(amountPaid)) {
-    console.log('❌ Extraction failed:', { contractNumber, amountPaid });
-    return res.status(400).send('<Response></Response>');
+  if (!payment_id || !paid_amount || !paid_date) {
+    return res.status(400).json({ message: 'جميع الحقول مطلوبة: payment_id, paid_amount, paid_date' });
   }
 
   try {
-    console.log('🔎 Querying contract from DB:', contractNumber);
+    // جلب تفاصيل الدفعة والمستأجر
+    const paymentDetails = await query(
+      `SELECT payment_amount, paid_amount, tenant_id FROM payments 
+       JOIN rental_contracts_details ON payments.contract_id = rental_contracts_details.id 
+       WHERE payments.id = ?`,
+      [payment_id]  
+    );
 
-    const [contract] = await query(`
-      SELECT id, tenant_id FROM rental_contracts_details
-      WHERE contract_number LIKE ?
-      LIMIT 1
-    `, [`${contractNumber}%`]);
-
-    if (!contract) {
-      console.log('❌ Contract not found:', contractNumber);
-      return res.status(404).send('<Response></Response>');
+    if (paymentDetails.length === 0) {
+      return res.status(404).json({ message: 'الدفعة غير موجودة' });
     }
 
-    console.log('✅ Contract found:', contract.id);
+    const { payment_amount, paid_amount: previous_paid, tenant_id } = paymentDetails[0];
 
-    const paymentResult = await query(`
-      UPDATE payments
-      SET payment_status = 'مدفوعة', 
-          paid_date = CURDATE(), 
-          payment_note = 'دفعة مسجلة تلقائيًا بقيمة ${amountPaid}'
-      WHERE contract_id = ? AND payment_status = 'غير مدفوعة'
-      ORDER BY due_date ASC
-      LIMIT 1
-    `, [contract.id]);
+    const total_paid_amount = parseFloat(previous_paid || 0) + parseFloat(paid_amount);
+    const remaining_amount = parseFloat(payment_amount) - total_paid_amount;
 
-    if (paymentResult.affectedRows > 0) {
-      console.log('✅ Payment updated successfully for contract:', contractNumber);
+    let payment_status = '';
 
-      const [user] = await query(`
-        SELECT fcm_token FROM users 
-        WHERE id = ?
-      `, [contract.tenant_id]);
+    if (remaining_amount > 0) {
+      payment_status = 'مدفوعة جزئياً';
+    } else if (remaining_amount <= 0) {
+      payment_status = 'مدفوعة';
+    }
 
-      if (user && user.fcm_token) {
-        const message = {
+    const payment_note =
+      remaining_amount > 0
+        ? `تم دفع مبلغ ${total_paid_amount} ريال، المتبقي ${remaining_amount} ريال`
+        : 'دفعة مستلمة بالكامل';
+
+    // تحديث بيانات الدفعة
+    await query(
+      `UPDATE payments SET payment_status = ?, paid_date = ?, paid_amount = ?, remaining_amount = ?, reminder_date = ?, payment_note = ? WHERE id = ?`,
+      [payment_status, paid_date, total_paid_amount, remaining_amount, reminder_date || null, payment_note, payment_id]
+    );
+
+    // جلب FCM Token للمستأجر
+    const tenantFCM = await query('SELECT user_id, fcm_token FROM users WHERE id = ?', [tenant_id]);
+    const userId = tenantFCM.length > 0 ? tenantFCM[0].user_id : null;
+    const fcmToken = tenantFCM.length > 0 ? tenantFCM[0].fcm_token : null;
+
+    // إرسال إشعار FCM إذا متوفر
+    if (fcmToken) {
+      const accessToken = await getAccessToken();
+      const message = {
+        message: {
+          token: fcmToken,
           notification: {
-            title: 'تأكيد الدفع ✅',
-            body: `تم تسجيل دفعتك بقيمة ${amountPaid} ريال بنجاح.`,
+            title: 'تحديث في الدفعات 💳',
+            body: payment_note,
           },
-          token: user.fcm_token,
-        };
+          data: {
+            screen: 'notifications',
+            userId: userId ? String(userId) : '',
+            userType: 'user',
+            senderType: 'admin'
+          }
+        }
+      };
 
-        admin.messaging().send(message)
-          .then(() => console.log('✅ Firebase notification sent successfully.'))
-          .catch((err) => console.error('❌ Error sending Firebase notification:', err));
-
-      } else {
-        console.log('⚠️ No valid FCM token for this tenant.');
-      }
-
-    } else {
-      console.log('⚠️ No unpaid payments found for contract:', contractNumber);
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(message),
+        }
+      );
     }
 
-    res.status(200).send('<Response></Response>');
+    // إضافة سجل في جدول الإشعارات ليظهر في صفحة الإشعارات
+    if (userId) {
+      await query(
+        `INSERT INTO notifications (user_id, title, body) VALUES (?, ?, ?)`,
+        [userId, 'تحديث في الدفعات 💳', payment_note]
+      );
+    }
 
-  } catch (err) {
-    console.error('❌ Error during DB operation:', err);
-    res.status(500).send('<Response></Response>');
+    return res.json({
+      success: true,
+      message: remaining_amount > 0 ? 'تم تسجيل الدفعة الجزئية بنجاح' : 'تم تسجيل الدفعة بالكامل',
+      remaining_amount,
+      payment_status,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: 'خطأ في تحديث الدفعة' });
   }
 });
+
+
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
