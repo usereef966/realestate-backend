@@ -6086,6 +6086,17 @@ app.get('/api/articles/:id/stats', verifyToken, async (req, res) => {
 });
 
 
+app.post('/api/twilio/sms-webhook', express.urlencoded({ extended: false }), (req, res) => {
+  const messageBody = req.body.Body; // نص الرسالة
+  const fromNumber = req.body.From; // رقم المرسل
+
+  console.log('📩 Received SMS:', messageBody);
+  console.log('📞 From:', fromNumber);
+
+  // رد بسيط لتأكيد الاستلام لـ Twilio
+  res.status(200).send('<Response></Response>');
+});
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
