@@ -481,6 +481,1004 @@ app.post('/api/create-tenant', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'حدث خطأ أثناء إنشاء المستأجر أو التوكن.' });
   }
 });
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////Super Admin Functions///////
+app.get('/api/superadmin', verifyToken, async (req, res) => {
+  try {
+    const result = await query("SELECT id, user_id, name, user_type FROM users WHERE user_type = 'super' LIMIT 1");
+
+    if (result.length === 0) {
+      return res.status(404).json({ message: 'No super admin found.' });
+    }
+
+    res.json(result[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server Error', error });
+  }
+});
+
+// ---------------------------------------------
+// Super Admin Tenants Page API Endpoints
+// ---------------------------------------------
+
+// 1. Tenant Stats
+app.get('/api/super/tenant-stats', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+
+  try {
+    // جلب إحصائيات المستأجرين
+    const [tenantCount] = await query(
+      'SELECT COUNT(*) AS total_tenants FROM rental_contracts_details WHERE admin_id = ? AND contract_end >= CURDATE()',
+      [superAdminId]
+    );
+
+    const [activeContracts] = await query(
+      'SELECT COUNT(*) AS active_contracts FROM rental_contracts_details WHERE admin_id = ? AND contract_end >= CURDATE()',
+      [superAdminId]
+    );
+
+    const [expiredContracts] = await query(
+      'SELECT COUNT(*) AS expired_contracts FROM rental_contracts_details WHERE admin_id = ? AND contract_end < CURDATE()',
+      [superAdminId]
+    );
+
+    // جلب آخر القيم من جدول super_stats_cache
+    let [cache] = await query(
+      'SELECT * FROM super_stats_cache WHERE super_id = ?',
+      [superAdminId]
+    );
+
+    // إذا لم يوجد صف، أنشئ واحد جديد
+    if (!cache) {
+      await query(
+        `INSERT INTO super_stats_cache (super_id, last_total_tenants, last_active_contracts, last_expired_contracts) VALUES (?, ?, ?, ?)`,
+        [superAdminId, tenantCount.total_tenants, activeContracts.active_contracts, expiredContracts.expired_contracts]
+      );
+      cache = {
+        last_total_tenants: 0,
+        last_active_contracts: 0,
+        last_expired_contracts: 0
+      };
+    }
+
+    // جلب FCM Token الخاص بالسوبر الحالي
+    const [superAdmin] = await query(
+      'SELECT user_id, fcm_token FROM users WHERE id = ? AND user_type = ?',
+      [superAdminId, 'super']
+    );
+
+    // تحقق إذا زاد أي رقم
+    let shouldNotify = false;
+    if (
+      tenantCount.total_tenants > (cache.last_total_tenants || 0) ||
+      activeContracts.active_contracts > (cache.last_active_contracts || 0) ||
+      expiredContracts.expired_contracts > (cache.last_expired_contracts || 0)
+    ) {
+      shouldNotify = true;
+    }
+
+    // إذا لازم إشعار، أرسل الإشعار وحدث القيم
+    if (shouldNotify && superAdmin && superAdmin.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: superAdmin.fcm_token,
+          notification: {
+            title: 'تحديث إحصائيات المستأجرين',
+            body: `تم استعراض إحصائيات المستأجرين لديك: ${tenantCount.total_tenants} مستأجر`
+          },
+          data: {
+            screen: 'tenant-stats'
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationPayload),
+        }
+      );
+
+      // تحديث القيم في الجدول
+      await query(
+        `UPDATE super_stats_cache SET last_total_tenants = ?, last_active_contracts = ?, last_expired_contracts = ? WHERE super_id = ?`,
+        [
+          tenantCount.total_tenants,
+          activeContracts.active_contracts,
+          expiredContracts.expired_contracts,
+          superAdminId
+        ]
+      );
+    }
+
+    // إرسال النتائج النهائية
+    res.json({
+      total_tenants: tenantCount.total_tenants,
+      active_contracts: activeContracts.active_contracts,
+      expired_contracts: expiredContracts.expired_contracts,
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error fetching tenant stats' });
+  }
+});
+
+
+// 2. Tenant Reports (Payment Status)
+app.get('/api/super/tenant-reports', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+
+  try {
+    const paymentStatusReport = await query(
+      `SELECT p.payment_status, COUNT(*) AS count 
+       FROM payments p 
+       JOIN rental_contracts_details rcd ON p.contract_id = rcd.id 
+       WHERE rcd.admin_id = ? AND rcd.contract_end >= CURDATE()
+       GROUP BY p.payment_status`,
+      [superAdminId]
+    );
+
+    const totalReports = paymentStatusReport.reduce((sum, row) => sum + Number(row.count), 0);
+
+    let [cache] = await query(
+      'SELECT * FROM super_stats_cache WHERE super_id = ?',
+      [superAdminId]
+    );
+
+    if (!cache) {
+      await query(
+        `INSERT INTO super_stats_cache (super_id, last_reports_status_count) VALUES (?, ?)`,
+        [superAdminId, totalReports]
+      );
+      cache = { last_reports_status_count: 0 };
+    }
+
+    const [superAdmin] = await query(
+      'SELECT user_id, fcm_token FROM users WHERE id = ? AND user_type = ?',
+      [superAdminId, 'super']
+    );
+
+    let shouldNotify = false;
+    if (totalReports > (cache.last_reports_status_count || 0)) {
+      shouldNotify = true;
+    }
+
+    if (shouldNotify && superAdmin && superAdmin.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: superAdmin.fcm_token,
+          notification: {
+            title: 'تقرير الدفعات المحدّث',
+            body: `تم استعراض تقرير الدفعات للمستأجرين`
+          },
+          data: {
+            screen: 'tenant-reports'
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationPayload),
+        }
+      );
+
+      await query(
+        `UPDATE super_stats_cache SET last_reports_status_count = ? WHERE super_id = ?`,
+        [totalReports, superAdminId]
+      );
+    }
+
+    res.json(paymentStatusReport);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error fetching tenant reports' });
+  }
+});
+
+
+
+app.get('/api/super/reports-count', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+
+  try {
+    // استعلام لإحضار عدد التقارير (دفعات المستأجرين)
+    const [reportsCount] = await query(
+      `SELECT COUNT(*) AS total_reports
+FROM payments p
+JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+WHERE rcd.admin_id = ? AND rcd.contract_end >= CURDATE()
+`,
+      [superAdminId]
+    );
+
+    // جلب آخر القيم من جدول super_stats_cache
+    let [cache] = await query(
+      'SELECT * FROM super_stats_cache WHERE super_id = ?',
+      [superAdminId]
+    );
+
+    // إذا لم يوجد صف، أنشئ واحد جديد
+    if (!cache) {
+      await query(
+        `INSERT INTO super_stats_cache (super_id, last_reports_count) VALUES (?, ?)`,
+        [superAdminId, reportsCount.total_reports]
+      );
+      cache = { last_reports_count: 0 };
+    }
+
+    // جلب FCM Token للسوبر
+    const [superAdmin] = await query(
+      'SELECT user_id, fcm_token FROM users WHERE id = ? AND user_type = ?',
+      [superAdminId, 'super']
+    );
+
+    // تحقق إذا زاد العدد
+    let shouldNotify = false;
+    if (reportsCount.total_reports > (cache.last_reports_count || 0)) {
+      shouldNotify = true;
+    }
+
+    // إرسال إشعار فقط إذا زاد العدد
+    if (shouldNotify && superAdmin && superAdmin.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: superAdmin.fcm_token,
+          notification: {
+            title: 'استعراض عدد التقارير',
+            body: `لديك ${reportsCount.total_reports} تقرير متوفر`
+          },
+          data: {
+            screen: 'reports-count'
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationPayload),
+        }
+      );
+
+      // تحديث القيم في الجدول
+      await query(
+        `UPDATE super_stats_cache SET last_reports_count = ? WHERE super_id = ?`,
+        [reportsCount.total_reports, superAdminId]
+      );
+    }
+
+    res.json({ total_reports: reportsCount.total_reports });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error fetching reports count' });
+  }
+});
+
+
+
+
+app.get('/api/super/tenant-payments-details', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+
+  try {
+    const paymentsDetails = await query(
+      `SELECT
+        p.id AS payment_id,
+        p.payment_number,
+        p.payment_amount,
+        p.due_date,
+        p.payment_status,
+        p.paid_date,
+        p.payment_note,
+        rcd.tenant_name,
+        rcd.tenant_phone,
+        rcd.unit_number,
+        rcd.contract_number,
+        rcd.contract_start,
+        rcd.contract_end
+      FROM payments p
+      JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+      WHERE rcd.admin_id = ? AND rcd.contract_end >= CURDATE()
+      ORDER BY p.due_date ASC`,
+      [superAdminId]
+    );
+
+    const hash = crypto.createHash('md5').update(JSON.stringify(paymentsDetails)).digest('hex');
+
+    let [cache] = await query(
+      'SELECT * FROM super_stats_cache WHERE super_id = ?',
+      [superAdminId]
+    );
+
+    if (!cache) {
+      await query(
+        `INSERT INTO super_stats_cache (super_id, last_payments_details_hash) VALUES (?, ?)`,
+        [superAdminId, hash]
+      );
+      cache = { last_payments_details_hash: null };
+    }
+
+    let shouldNotify = false;
+    if (hash !== (cache.last_payments_details_hash || '')) {
+      shouldNotify = true;
+    }
+
+    if (shouldNotify) {
+      const [superAdmin] = await query(
+        'SELECT user_id, fcm_token FROM users WHERE id = ? AND user_type = ?',
+        [superAdminId, 'super']
+      );
+
+      if (superAdmin && superAdmin.fcm_token) {
+        const notificationPayload = {
+          message: {
+            token: superAdmin.fcm_token,
+            notification: {
+              title: 'تفاصيل دفعات المستأجرين',
+              body: `تم استعراض تفاصيل جميع الدفعات. لديك ${paymentsDetails.length} دفعة.`
+            },
+            data: {
+              screen: 'tenant-payments-details'
+            }
+          }
+        };
+
+        const accessToken = await getAccessToken();
+
+        await fetch(
+          `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(notificationPayload),
+          }
+        );
+
+        await query(
+          `UPDATE super_stats_cache SET last_payments_details_hash = ? WHERE super_id = ?`,
+          [hash, superAdminId]
+        );
+      }
+    }
+
+    res.json(paymentsDetails);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error fetching tenant payments details' });
+  }
+});
+
+
+
+// 3. Tenants Details
+app.get('/api/super/tenants', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+
+  try {
+    const tenants = await query(
+      'SELECT tenant_name, tenant_phone, contract_number, contract_end FROM rental_contracts_details WHERE admin_id = ?',
+      [superAdminId]
+    );
+
+    // جلب آخر القيم من جدول super_stats_cache
+    let [cache] = await query(
+      'SELECT * FROM super_stats_cache WHERE super_id = ?',
+      [superAdminId]
+    );
+
+    // إذا لم يوجد صف، أنشئ واحد جديد
+    if (!cache) {
+      await query(
+        `INSERT INTO super_stats_cache (super_id, last_total_tenants) VALUES (?, ?)`,
+        [superAdminId, tenants.length]
+      );
+      cache = { last_total_tenants: 0 };
+    }
+
+    // جلب FCM Token للسوبر
+    const [superAdmin] = await query(
+      'SELECT user_id, fcm_token FROM users WHERE id = ? AND user_type = ?',
+      [superAdminId, 'super']
+    );
+
+    // تحقق إذا زاد العدد
+    let shouldNotify = false;
+    if (tenants.length > (cache.last_total_tenants || 0)) {
+      shouldNotify = true;
+    }
+
+    // إرسال إشعار فقط إذا زاد العدد
+    if (shouldNotify && superAdmin && superAdmin.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: superAdmin.fcm_token,
+          notification: {
+            title: 'استعراض بيانات المستأجرين',
+            body: `تم استعراض قائمة المستأجرين لديك.`
+          },
+          data: {
+            screen: 'tenants-list'
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationPayload),
+        }
+      );
+
+      // تحديث العدد في الجدول
+      await query(
+        `UPDATE super_stats_cache SET last_total_tenants = ? WHERE super_id = ?`,
+        [tenants.length, superAdminId]
+      );
+    }
+
+    res.json(tenants);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error fetching tenants details' });
+  }
+});
+
+// 4. Maintenance Requests
+app.get('/api/super/maintenance-requests', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+
+  try {
+    const requests = await query(
+      'SELECT mr.id, mr.category, mr.description, mr.status, mr.created_at, rcd.tenant_name, rcd.unit_number, rcd.tenant_phone FROM maintenance_requests mr JOIN rental_contracts_details rcd ON mr.tenant_id = rcd.tenant_id WHERE mr.owner_id = ? ORDER BY mr.created_at DESC',
+      [superAdminId]
+    );
+
+    // جلب آخر القيم من جدول super_stats_cache
+    let [cache] = await query(
+      'SELECT * FROM super_stats_cache WHERE super_id = ?',
+      [superAdminId]
+    );
+
+    // إذا لم يوجد صف، أنشئ واحد جديد
+    if (!cache) {
+      await query(
+        `INSERT INTO super_stats_cache (super_id, last_maintenance_requests_count) VALUES (?, ?)`,
+        [superAdminId, requests.length]
+      );
+      cache = { last_maintenance_requests_count: 0 };
+    }
+
+    // جلب FCM Token للسوبر
+    const [superAdmin] = await query(
+      'SELECT user_id, fcm_token FROM users WHERE id = ? AND user_type = ?',
+      [superAdminId, 'super']
+    );
+
+    // تحقق إذا زاد العدد
+    let shouldNotify = false;
+    if (requests.length > (cache.last_maintenance_requests_count || 0)) {
+      shouldNotify = true;
+    }
+
+    // إرسال إشعار فقط إذا زاد العدد
+    if (shouldNotify && superAdmin && superAdmin.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: superAdmin.fcm_token,
+          notification: {
+            title: 'استعراض طلبات الصيانة',
+            body: `تم استعراض طلبات الصيانة لديك`
+          },
+          data: {
+            screen: 'maintenance-requests'
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationPayload),
+        }
+      );
+
+      // تحديث العدد في الجدول
+      await query(
+        `UPDATE super_stats_cache SET last_maintenance_requests_count = ? WHERE super_id = ?`,
+        [requests.length, superAdminId]
+      );
+    }
+
+    res.json(requests);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error fetching maintenance requests' });
+  }
+});
+
+
+app.post('/api/super/update-maintenance-request-status', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+  const { request_id, new_status, admin_notes } = req.body;
+
+  if (!request_id || !new_status) {
+    return res.status(400).json({ message: '❗️ الطلب غير مكتمل: مطلوب رقم الطلب والحالة الجديدة.' });
+  }
+
+  try {
+    // تحديث حالة الطلب مع ملاحظات الأدمن
+    const updateResult = await query(
+      `UPDATE maintenance_requests
+       SET status = ?, admin_notes = ?, is_read = 0
+       WHERE id = ? AND owner_id = ?`,
+      [new_status, admin_notes || null, request_id, superAdminId]
+    );
+
+    if (updateResult.affectedRows === 0) {
+      return res.status(404).json({ message: '❌ لم يتم العثور على طلب الصيانة أو غير مرتبط بك.' });
+    }
+
+    // جلب بيانات المستأجر لإرسال الإشعار
+    const [tenantInfo] = await query(`
+      SELECT u.fcm_token, u.name, mr.category
+      FROM maintenance_requests mr
+      JOIN users u ON mr.tenant_id = u.id
+      WHERE mr.id = ?`, [request_id]);
+
+    if (tenantInfo && tenantInfo.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: tenantInfo.fcm_token,
+          notification: {
+            title: `تم تحديث حالة طلب الصيانة`,
+            body: `طلب الصيانة (${tenantInfo.category}) أصبح بحالة: ${new_status}`
+          },
+          data: {
+            screen: 'maintenance-details',
+            requestId: request_id.toString()
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(notificationPayload)
+        }
+      );
+    }
+
+    res.json({
+      message: '✅ تم تحديث حالة طلب الصيانة وإرسال إشعار للمستأجر بنجاح.',
+      request_id,
+      new_status
+    });
+
+  } catch (err) {
+    console.error('❌ Maintenance request status update error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء تحديث حالة طلب الصيانة.' });
+  }
+});
+
+
+
+// 5. Noise Complaints
+app.get('/api/super/noise-complaints', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+
+  try {
+    const complaints = await query(
+      'SELECT nc.id, nc.category, nc.description, nc.status, nc.created_at, rcd.tenant_name, rcd.unit_number, rcd.tenant_phone FROM noise_complaints nc JOIN rental_contracts_details rcd ON nc.tenant_id = rcd.tenant_id WHERE nc.admin_id = ? ORDER BY nc.created_at DESC',
+      [superAdminId]
+    );
+
+    // جلب آخر القيم من جدول super_stats_cache
+    let [cache] = await query(
+      'SELECT * FROM super_stats_cache WHERE super_id = ?',
+      [superAdminId]
+    );
+
+    // إذا لم يوجد صف، أنشئ واحد جديد
+    if (!cache) {
+      await query(
+        `INSERT INTO super_stats_cache (super_id, last_noise_complaints_count) VALUES (?, ?)`,
+        [superAdminId, complaints.length]
+      );
+      cache = { last_noise_complaints_count: 0 };
+    }
+
+    // جلب FCM Token للسوبر
+    const [superAdmin] = await query(
+      'SELECT user_id, fcm_token FROM users WHERE id = ? AND user_type = ?',
+      [superAdminId, 'super']
+    );
+
+    // تحقق إذا زاد العدد
+    let shouldNotify = false;
+    if (complaints.length > (cache.last_noise_complaints_count || 0)) {
+      shouldNotify = true;
+    }
+
+    // إرسال إشعار فقط إذا زاد العدد
+    if (shouldNotify && superAdmin && superAdmin.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: superAdmin.fcm_token,
+          notification: {
+            title: 'استعراض شكاوى الإزعاج',
+            body: `تم استعراض شكاوى الإزعاج لدى مستأجريك`
+          },
+          data: {
+            screen: 'noise-complaints'
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationPayload),
+        }
+      );
+
+      // تحديث العدد في الجدول
+      await query(
+        `UPDATE super_stats_cache SET last_noise_complaints_count = ? WHERE super_id = ?`,
+        [complaints.length, superAdminId]
+      );
+    }
+
+    res.json(complaints);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error fetching noise complaints' });
+  }
+});
+
+
+app.post('/api/super/update-noise-complaint-status', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+  const { complaint_id, new_status, admin_notes } = req.body;
+
+  const allowedStatuses = ['جديد', 'قيد المعالجة', 'تم الحل'];
+
+  if (!complaint_id || !new_status || !allowedStatuses.includes(new_status)) {
+    return res.status(400).json({ 
+      message: '❗️ يرجى توفير رقم الشكوى وحالة جديدة صحيحة (جديد، قيد المعالجة، تم الحل).' 
+    });
+  }
+
+  try {
+    const updateResult = await query(
+      `UPDATE noise_complaints
+       SET status = ?, admin_notes = ?, is_read = 0
+       WHERE id = ? AND admin_id = ?`,
+      [new_status, admin_notes || null, complaint_id, superAdminId]
+    );
+
+    if (updateResult.affectedRows === 0) {
+      return res.status(404).json({ message: '❌ لم يتم العثور على شكوى الإزعاج أو أنها غير مرتبطة بك.' });
+    }
+
+    const [tenantInfo] = await query(`
+      SELECT u.fcm_token, u.name, nc.category
+      FROM noise_complaints nc
+      JOIN users u ON nc.tenant_id = u.id
+      WHERE nc.id = ?`, [complaint_id]);
+
+    if (tenantInfo && tenantInfo.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: tenantInfo.fcm_token,
+          notification: {
+            title: `تحديث حالة شكوى الإزعاج`,
+            body: `شكواك (${tenantInfo.category}) أصبحت بحالة: ${new_status}`
+          },
+          data: {
+            screen: 'noise-complaint-details',
+            complaintId: complaint_id.toString()
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(notificationPayload)
+        }
+      );
+    }
+
+    res.json({
+      message: '✅ تم تحديث حالة شكوى الإزعاج وإرسال إشعار للمستأجر بنجاح.',
+      complaint_id,
+      new_status
+    });
+
+  } catch (err) {
+    console.error('❌ Noise complaint status update error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء تحديث حالة شكوى الإزعاج.' });
+  }
+});
+
+
+
+
+app.get('/api/super/full-active-contracts', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+
+  try {
+    const contracts = await query(
+      `SELECT
+        id, contract_number, contract_type, contract_date,
+        contract_start, contract_end, contract_location,
+        owner_name, owner_nationality, owner_id_type, owner_id_number,
+        owner_email, owner_phone, owner_address,
+        tenant_name, tenant_nationality, tenant_id_type, tenant_id_number,
+        tenant_email, tenant_phone, tenant_address,
+        property_national_address, property_building_type, property_usage,
+        property_units_count, property_floors_count, unit_type, unit_number,
+        unit_floor_number, unit_area, unit_furnishing_status,
+        unit_ac_units_count, unit_ac_type, annual_rent,
+        periodic_rent_payment, rent_payment_cycle, rent_payments_count,
+        total_contract_value, pdf_path, tenant_id,
+        admin_id, property_id, created_at, tenant_serial_number
+      FROM rental_contracts_details
+      WHERE admin_id = ? AND contract_end >= CURDATE()
+      ORDER BY contract_end ASC`,
+      [superAdminId]
+    );
+
+    // جلب آخر القيم من جدول super_stats_cache
+    let [cache] = await query(
+      'SELECT * FROM super_stats_cache WHERE super_id = ?',
+      [superAdminId]
+    );
+
+    // إذا لم يوجد صف، أنشئ واحد جديد
+    if (!cache) {
+      await query(
+        `INSERT INTO super_stats_cache (super_id, last_full_active_contracts_count) VALUES (?, ?)`,
+        [superAdminId, contracts.length]
+      );
+      cache = { last_full_active_contracts_count: 0 };
+    }
+
+    // جلب FCM Token للسوبر
+    const [superAdmin] = await query(
+      'SELECT user_id, fcm_token FROM users WHERE id = ? AND user_type = ?',
+      [superAdminId, 'super']
+    );
+
+    // تحقق إذا زاد العدد
+    let shouldNotify = false;
+    if (contracts.length > (cache.last_full_active_contracts_count || 0)) {
+      shouldNotify = true;
+    }
+
+    // إرسال إشعار فقط إذا زاد العدد
+    if (shouldNotify && superAdmin && superAdmin.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: superAdmin.fcm_token,
+          notification: {
+            title: 'تم استعراض تفاصيل العقود الفعالة',
+            body: `تم جلب تفاصيل ${contracts.length} عقد فعّال لديك.`
+          },
+          data: {
+            screen: 'full-active-contracts'
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationPayload),
+        }
+      );
+
+      // تحديث العدد في الجدول
+      await query(
+        `UPDATE super_stats_cache SET last_full_active_contracts_count = ? WHERE super_id = ?`,
+        [contracts.length, superAdminId]
+      );
+    }
+
+    res.json(contracts);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error fetching full active contracts' });
+  }
+});
+
+
+
+
+app.get('/api/super/expired-contracts', verifyToken, async (req, res) => {
+  const superAdminId = req.user.id;
+
+  try {
+    const expiredContracts = await query(
+      `SELECT
+        id,
+        contract_number,
+        contract_type,
+        contract_date,
+        contract_start,
+        contract_end,
+        contract_location,
+        tenant_name,
+        tenant_phone,
+        tenant_email,
+        unit_number,
+        unit_area,
+        annual_rent,
+        total_contract_value,
+        pdf_path,
+        created_at
+      FROM rental_contracts_details
+      WHERE admin_id = ? AND contract_end < CURDATE()
+      ORDER BY contract_end DESC`,
+      [superAdminId]
+    );
+
+    // جلب آخر القيم من جدول super_stats_cache
+    let [cache] = await query(
+      'SELECT * FROM super_stats_cache WHERE super_id = ?',
+      [superAdminId]
+    );
+
+    // إذا لم يوجد صف، أنشئ واحد جديد
+    if (!cache) {
+      await query(
+        `INSERT INTO super_stats_cache (super_id, last_expired_contracts_count) VALUES (?, ?)`,
+        [superAdminId, expiredContracts.length]
+      );
+      cache = { last_expired_contracts_count: 0 };
+    }
+
+    // جلب FCM Token للسوبر
+    const [superAdmin] = await query(
+      'SELECT user_id, fcm_token FROM users WHERE id = ? AND user_type = ?',
+      [superAdminId, 'super']
+    );
+
+    // إرسال إشعار فقط إذا تغير العدد
+    let shouldNotify = false;
+    if (expiredContracts.length !== (cache.last_expired_contracts_count || 0)) {
+      shouldNotify = true;
+    }
+
+    if (shouldNotify && superAdmin && superAdmin.fcm_token) {
+      const notificationPayload = {
+        message: {
+          token: superAdmin.fcm_token,
+          notification: {
+            title: 'تفاصيل العقود المنتهية',
+            body: `تم استعراض تفاصيل ${expiredContracts.length} عقد منتهي لديك.`
+          },
+          data: {
+            screen: 'expired-contracts'
+          }
+        }
+      };
+
+      const accessToken = await getAccessToken();
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationPayload),
+        }
+      );
+
+      // تحديث العدد في الجدول
+      await query(
+        `UPDATE super_stats_cache SET last_expired_contracts_count = ? WHERE super_id = ?`,
+        [expiredContracts.length, superAdminId]
+      );
+    }
+
+    res.json(expiredContracts);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error fetching expired contracts details' });
+  }
+});
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 const axios = require('axios');
@@ -2073,6 +3071,133 @@ app.get('/api/admin-received-notifications/:adminId', verifyToken, async (req, r
 
 
 
+app.get('/api/super-received-notifications/:superId', verifyToken, async (req, res) => {
+  const { superId } = req.params;
+
+  try {
+    // جلب كل الملاك (admins) الذين أنشأهم هذا السوبر
+    const admins = await query(
+      `SELECT id FROM users WHERE user_type = 'admin' AND created_by = ?`,
+      [superId]
+    );
+    const adminIds = admins.map(a => a.id);
+
+    // جلب كل المستأجرين المرتبطين بأي مالك أنشأه هذا السوبر
+    let tenants = [];
+    if (adminIds.length) {
+      tenants = await query(
+        `SELECT u.id, u.user_id, u.name
+         FROM users u
+         JOIN rental_contracts_details rcd ON u.id = rcd.tenant_id
+         WHERE rcd.admin_id IN (${adminIds.map(() => '?').join(',')})`,
+        adminIds
+      );
+    }
+
+    // جلب كل المستأجرين المرتبطين مباشرة بالسوبر (لو كان السوبر نفسه مالك)
+    const directTenants = await query(
+      `SELECT u.id, u.user_id, u.name
+       FROM users u
+       JOIN rental_contracts_details rcd ON u.id = rcd.tenant_id
+       WHERE rcd.admin_id = ?`,
+      [superId]
+    );
+
+    // دمج كل المستأجرين بدون تكرار
+    const allTenants = [...tenants, ...directTenants];
+    const tenantIds = [...new Set(allTenants.map(t => t.id))];
+    if (!tenantIds.length) return res.json({ notifications: [] });
+
+    // إشعارات عامة
+    const notifications = await query(
+      `SELECT n.id, n.title, n.body, n.is_read, n.created_at, u.name as tenantName, 'notification' as type
+       FROM notifications n
+       JOIN users u ON n.user_id = u.user_id
+       WHERE u.id IN (${tenantIds.map(() => '?').join(',')})
+       GROUP BY n.id
+       ORDER BY n.created_at DESC`,
+      tenantIds
+    );
+
+    // إشعارات الصيانة
+    const maintenance = await query(
+      `SELECT m.id, CONCAT('طلب صيانة من ', u.name) as title, m.description as body, m.is_read, m.created_at, u.name as tenantName, 'maintenance' as type
+       FROM maintenance_requests m
+       JOIN users u ON m.tenant_id = u.id
+       WHERE m.owner_id = ?
+       ORDER BY m.created_at DESC`,
+      [superId]
+    );
+
+    // إشعارات الإزعاج
+    const noise = await query(
+      `SELECT n.id, CONCAT('بلاغ إزعاج من ', u.name) as title, n.description as body, n.is_read, n.created_at, u.name as tenantName, 'noise' as type
+       FROM noise_complaints n
+       JOIN users u ON n.tenant_id = u.id
+       WHERE n.admin_id = ?
+       ORDER BY n.created_at DESC`,
+      [superId]
+    );
+
+    // إشعارات الدفعات المتأخرة
+    const latePayments = await query(
+      `SELECT l.id, 'تنبيه دفعة متأخرة' as title, CONCAT('لدى المستأجر ', u.name, ' دفعة متأخرة.') as body, l.is_read, l.last_sent_date as created_at, u.name as tenantName, 'late_payment' as type
+       FROM late_payment_notifications l
+       JOIN users u ON l.tenant_id = u.id
+       WHERE l.admin_id = ?
+       ORDER BY l.last_sent_date DESC`,
+      [superId]
+    );
+    let chat = [];
+
+// دمج tenantIds والسوبر مباشرة معًا
+const receiverIds = [...tenantIds, superId];
+
+if (receiverIds.length) {
+  chat = await query(
+    `SELECT 
+      m.id, 
+      'رسالة جديدة في الدردشة' as title, 
+      m.message as body, 
+      m.is_read, 
+      m.timestamp as created_at, 
+      'chat' as type,
+      m.chat_room_id as chatRoomId,
+      m.receiver_id as userId,
+      m.sender_id as otherUserId,
+      u2.name as otherUserName
+    FROM messages m
+    JOIN chat_rooms cr ON m.chat_room_id = cr.id
+    JOIN users u1 ON m.receiver_id = u1.user_id OR m.receiver_id = u1.id
+    JOIN users u2 ON m.sender_id = u2.user_id OR m.sender_id = u2.id
+    WHERE (u1.id IN (${receiverIds.map(() => '?').join(',')}))
+      AND (m.receiver_id = u1.user_id OR m.receiver_id = u1.id)
+      AND m.is_read = 0
+    ORDER BY m.timestamp DESC`,
+    receiverIds
+  );
+}
+
+
+
+    // دمج وترتيب حسب التاريخ
+    const all = [
+      ...notifications,
+      ...maintenance,
+      ...noise,
+      ...latePayments,
+      ...chat
+    ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    res.json({ notifications: all });
+  } catch (err) {
+    console.error('❌ Super notifications error:', err);
+    res.status(500).json({ message: 'خطأ في جلب إشعارات السوبر', error: err });
+  }
+});
+
+
+
 
 
 
@@ -2080,7 +3205,7 @@ app.post('/api/admin/send-notification', verifyToken, async (req, res) => {
   const { userType, id: adminId } = req.user;
   const { title, body, userId, userIds } = req.body;
 
-  if (userType !== 'admin') {
+  if (userType !== 'super' && userType !== 'admin') {
     return res.status(403).json({ message: '❌ فقط المالك يمكنه استخدام هذا المسار' });
   }
 
@@ -2458,11 +3583,51 @@ app.put('/api/maintenance-requests/:id/read', verifyToken, async (req, res) => {
     }
 
     await query('UPDATE maintenance_requests SET is_read = 1 WHERE id = ?', [id]);
-    res.json({ message: 'تم التعليم كمقروء' });
+
+    // ✅ جلب بيانات المستأجر لإرسال FCM
+    const [tenant] = await query(`
+      SELECT u.user_id, u.fcm_token 
+      FROM maintenance_requests mr 
+      JOIN users u ON mr.tenant_id = u.id 
+      WHERE mr.id = ?`, [id]);
+
+    // ✅ إرسال إشعار FCM للمستأجر
+    if (tenant && tenant.fcm_token) {
+      const accessToken = await getAccessToken();
+      const message = {
+        message: {
+          token: tenant.fcm_token,
+          notification: {
+            title: 'تحديث طلب الصيانة ✅',
+            body: 'تم تحديث حالة طلب الصيانة الخاص بك.'
+          },
+          data: {
+            screen: 'notifications',
+            userId: tenant.user_id,
+            userType: 'user',
+            senderType: 'admin'
+          }
+        }
+      };
+
+      await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(message),
+      });
+    }
+
+    res.json({ message: 'تم التعليم كمقروء وإرسال إشعار للمستأجر' });
+
   } catch (err) {
-    res.status(500).json({ message: 'خطأ', error: err });
+    console.error('❌ Maintenance Request Read Error:', err);
+    res.status(500).json({ message: 'خطأ داخلي', error: err });
   }
 });
+
 
 
 app.put('/api/noise-complaints/:id/read', verifyToken, async (req, res) => {
@@ -2486,11 +3651,50 @@ app.put('/api/noise-complaints/:id/read', verifyToken, async (req, res) => {
     }
 
     await query('UPDATE noise_complaints SET is_read = 1 WHERE id = ?', [id]);
-    res.json({ message: 'تم التعليم كمقروء' });
+
+    // ✅ جلب بيانات المستأجر لإرسال FCM
+    const [tenant] = await query(`
+      SELECT u.user_id, u.fcm_token 
+      FROM noise_complaints nc
+      JOIN users u ON nc.tenant_id = u.id 
+      WHERE nc.id = ?`, [id]);
+
+    // ✅ إرسال إشعار FCM للمستأجر
+    if (tenant && tenant.fcm_token) {
+      const accessToken = await getAccessToken();
+      const message = {
+        message: {
+          token: tenant.fcm_token,
+          notification: {
+            title: 'تحديث شكوى الإزعاج ⚠️',
+            body: 'تم تحديث حالة شكوى الإزعاج الخاصة بك.'
+          },
+          data: {
+            screen: 'notifications',
+            userId: tenant.user_id,
+            userType: 'user',
+            senderType: 'admin'
+          }
+        }
+      };
+
+      await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(message),
+      });
+    }
+
+    res.json({ message: 'تم التعليم كمقروء وإرسال إشعار للمستأجر' });
   } catch (err) {
-    res.status(500).json({ message: 'خطأ', error: err });
+    console.error('❌ Noise Complaint Read Error:', err);
+    res.status(500).json({ message: 'خطأ داخلي', error: err });
   }
 });
+
 
 
 app.put('/api/messages/:id/read', verifyToken, async (req, res) => {
@@ -2508,6 +3712,183 @@ app.put('/api/messages/:id/read', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'خطأ', error: err });
   }
 });
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// إضافة محتوى جديد
+app.post('/api/super/articles', verifyToken, async (req, res) => {
+  const { title, content, type, image_url, start_date, end_date } = req.body;
+  const created_by = req.user.id;
+
+  try {
+    await query(`
+      INSERT INTO articles_offers_ads
+      (title, content, type, image_url, start_date, end_date, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [title, content, type, image_url, start_date, end_date, created_by]
+    );
+
+    // بعد إضافة المحتوى، أرسل إشعار للجميع (مستأجرين وملاك)
+    // جلب جميع المستخدمين الذين لديهم FCM Token
+    const users = await query(
+      `SELECT user_id, fcm_token FROM users WHERE fcm_token IS NOT NULL AND fcm_token != ''`
+    );
+
+    if (users.length > 0) {
+      const accessToken = await getAccessToken();
+      const sendAll = users.map(async (user) => {
+        const message = {
+          message: {
+            token: user.fcm_token,
+            notification: {
+              title: 'محتوى جديد',
+              body: title || 'تم نشر محتوى جديد في المنصة',
+            },
+            data: {
+              screen: 'articles',
+              userId: user.user_id,
+              senderType: 'super',
+              contentType: type 
+            }
+          }
+        };
+
+        try {
+          await fetch(
+            `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(message),
+            }
+          );
+          // حفظ الإشعار في جدول notifications
+          await query(
+            `INSERT INTO notifications (user_id, title, body) VALUES (?, ?, ?)`,
+            [user.user_id, 'محتوى جديد', title || 'تم نشر محتوى جديد في المنصة']
+          );
+        } catch (err) {
+          console.error(`❌ فشل إرسال إشعار للمستخدم ${user.user_id}:`, err);
+        }
+      });
+
+      await Promise.all(sendAll);
+    }
+
+    res.status(201).json({ message: 'تم إنشاء المحتوى بنجاح وتم إرسال إشعار لجميع المستخدمين' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء إنشاء المحتوى' });
+  }
+});
+
+// جلب جميع المحتويات
+app.get('/api/super/articles', verifyToken, async (req, res) => {
+  try {
+    const articles = await query('SELECT * FROM articles_offers_ads WHERE is_visible = TRUE ORDER BY id DESC');
+    res.json(articles);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب البيانات' });
+  }
+});
+
+// جلب محتوى واحد
+app.get('/api/super/articles/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [article] = await query(`SELECT * FROM articles_offers_ads WHERE id = ?`, [id]);
+    res.json(article);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب المحتوى' });
+  }
+});
+
+// تعديل محتوى
+app.put('/api/super/articles/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { title, content, type, image_url, start_date, end_date, is_active, is_visible } = req.body;
+
+  try {
+    await query(`
+      UPDATE articles_offers_ads
+      SET title=?, content=?, type=?, image_url=?, start_date=?, end_date=?, is_active=?, is_visible=?
+      WHERE id=?`,
+      [title, content, type, image_url, start_date, end_date, is_active, is_visible, id]
+    );
+    res.json({ message: 'تم تحديث المحتوى بنجاح' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء تحديث المحتوى' });
+  }
+});
+
+// حذف محتوى
+app.delete('/api/super/articles/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    await query(`UPDATE articles_offers_ads SET is_visible = FALSE WHERE id = ?`, [id]);
+    res.json({ message: 'تم إخفاء المحتوى بنجاح' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء إخفاء المحتوى' });
+  }
+});
+
+
+
+
+
+// جلب جميع المحتويات الفعالة
+app.get('/api/articles', verifyToken, async (req, res) => {
+  try {
+    const today = new Date();
+    const articles = await query(`
+      SELECT * FROM articles_offers_ads
+      WHERE is_active = true
+      AND (start_date IS NULL OR start_date <= ?)
+      AND (end_date IS NULL OR end_date >= ?)
+      ORDER BY created_at DESC`,
+      [today, today]
+    );
+    res.json(articles);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب المحتويات' });
+  }
+});
+
+// جلب محتوى واحد فعال
+app.get('/api/articles/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const today = new Date();
+
+  try {
+    const [article] = await query(`
+      SELECT * FROM articles_offers_ads
+      WHERE id = ?
+      AND is_active = true
+      AND (start_date IS NULL OR start_date <= ?)
+      AND (end_date IS NULL OR end_date >= ?)`,
+      [id, today, today]
+    );
+    res.json(article);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب المحتوى' });
+  }
+});
+
+
+
+
+
+
+
+
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2688,7 +4069,7 @@ app.get('/api/maintenance-requests/admin', verifyToken, async (req, res) => {
 
 
 app.put('/api/maintenance-requests/:id/status', verifyToken, async (req, res) => {
-  const { userType } = req.user;
+  const { userType, id: adminId } = req.user;
   const requestId = req.params.id;
   const { status, admin_notes } = req.body;
 
@@ -2735,23 +4116,27 @@ app.put('/api/maintenance-requests/:id/status', verifyToken, async (req, res) =>
       await query(`DELETE FROM maintenance_requests WHERE id = ?`, [requestId]);
     }
 
-    // جلب FCM Token للمستأجر
+    // جلب FCM Token و user_id للمستأجر
     const [tenant] = await query(
       `SELECT fcm_token, user_id FROM users WHERE id = ?`,
       [request.tenant_id]
     );
 
+    // إرسال إشعار FCM وإضافة سجل في جدول الإشعارات
     if (tenant && tenant.fcm_token) {
       const accessToken = await getAccessToken();
       const message = {
         message: {
           token: tenant.fcm_token,
           notification: {
-            title: 'تحديث حالة طلب الصيانة',
+            title: 'تحديث حالة طلب الصيانة 🛠️',
             body: `تم تحديث حالة طلب الصيانة (${request.category}) إلى: ${status}`,
           },
           data: {
-            screen: 'maintenance',
+            screen: 'notifications',
+            userId: tenant.user_id,
+            userType: 'user',
+            senderType: userType,
             status,
           },
         },
@@ -2769,6 +4154,17 @@ app.put('/api/maintenance-requests/:id/status', verifyToken, async (req, res) =>
         }
       );
     }
+
+    // ✅ إضافة سجل دائم في جدول الإشعارات
+    await query(`
+      INSERT INTO notifications (user_id, title, body, sender_id)
+      VALUES (?, ?, ?, ?)
+    `, [
+      tenant.user_id,
+      'تحديث حالة طلب الصيانة 🛠️',
+      `تم تحديث حالة طلب الصيانة (${request.category}) إلى: ${status}`,
+      adminId
+    ]);
 
     res.json({ message: '✅ تم تحديث حالة الطلب بنجاح' });
 
@@ -3382,9 +4778,8 @@ app.get('/api/noise-complaints/admin', verifyToken, async (req, res) => {
 });
 
 
-
 app.put('/api/noise-complaints/:id/status', verifyToken, async (req, res) => {
-  const { userType } = req.user;
+  const { userType, id: senderId } = req.user;
   const complaintId = req.params.id;
   const { status } = req.body;
 
@@ -3429,7 +4824,7 @@ app.put('/api/noise-complaints/:id/status', verifyToken, async (req, res) => {
       await query(`DELETE FROM noise_complaints WHERE id = ?`, [complaintId]);
     }
 
-    // جلب FCM Token للمستأجر
+    // جلب FCM Token و user_id للمستأجر
     const [tenant] = await query(
       `SELECT fcm_token, user_id FROM users WHERE id = ?`,
       [complaint.tenant_id]
@@ -3441,11 +4836,14 @@ app.put('/api/noise-complaints/:id/status', verifyToken, async (req, res) => {
         message: {
           token: tenant.fcm_token,
           notification: {
-            title: 'تحديث حالة بلاغ الإزعاج',
+            title: 'تحديث حالة بلاغ الإزعاج ⚠️',
             body: `تم تحديث حالة بلاغ (${complaint.category}) إلى: ${status}`,
           },
           data: {
-            screen: 'noise',
+            screen: 'notifications',
+            userId: tenant.user_id,
+            userType: 'user',
+            senderType: userType,
             status,
           },
         },
@@ -3464,6 +4862,17 @@ app.put('/api/noise-complaints/:id/status', verifyToken, async (req, res) => {
       );
     }
 
+    // ✅ إضافة سجل دائم في جدول الإشعارات
+    await query(`
+      INSERT INTO notifications (user_id, title, body, sender_id)
+      VALUES (?, ?, ?, ?)
+    `, [
+      tenant.user_id,
+      'تحديث حالة بلاغ الإزعاج ⚠️',
+      `تم تحديث حالة بلاغ (${complaint.category}) إلى: ${status}`,
+      senderId
+    ]);
+
     res.json({ message: '✅ تم تحديث حالة البلاغ بنجاح' });
 
   } catch (err) {
@@ -3471,7 +4880,6 @@ app.put('/api/noise-complaints/:id/status', verifyToken, async (req, res) => {
     res.status(500).json({ message: '❌ فشل في تحديث الحالة' });
   }
 });
-
 
 
 
@@ -4536,6 +5944,142 @@ app.post('/api/check-phone-registered', async (req, res) => {
 });
 
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+const articlesBucket = storage.bucket('image50154');  
+
+app.post('/api/upload-article-image', upload.single('image'), async (req, res) => {
+  try {
+    console.log('🔵 [رفع صورة] استقبلنا الطلب');
+    if (!req.file) {
+      console.warn('⚠️ لم يتم رفع صورة!');
+      return res.status(400).json({ message: 'لم يتم رفع صورة' });
+    }
+
+    const tempPath = req.file.path;
+    const gcsFileName = `articles/${Date.now()}-${req.file.originalname}`;
+    console.log('🔵 tempPath:', tempPath);
+    console.log('🔵 gcsFileName:', gcsFileName);
+
+    await articlesBucket.upload(tempPath, {
+      destination: gcsFileName,
+      resumable: false,
+      contentType: req.file.mimetype,
+      metadata: { cacheControl: 'public, max-age=31536000' },
+    });
+
+    console.log('✅ تم رفع الصورة بنجاح:', gcsFileName);
+
+    // أرجع اسم الملف فقط (وليس رابط)
+    res.json({ imageFileName: gcsFileName });
+  } catch (err) {
+    console.error('❌ Image Upload Error:', err, err.stack);
+    res.status(500).json({ message: 'فشل رفع الصورة', error: err.message });
+  }
+});
+
+app.get('/api/article-image/:fileName', verifyToken, async (req, res) => {
+  const { fileName } = req.params;
+  try {
+    console.log('🔵 [جلب رابط موقع] fileName:', fileName);
+    const filePath = fileName.startsWith('articles/') ? fileName : `articles/${fileName}`;
+    console.log('🔵 filePath المستخدم:', filePath);
+
+    const file = articlesBucket.file(filePath);
+
+    // تحقق من وجود الملف فعلياً
+    const [exists] = await file.exists();
+    console.log('🔵 هل الملف موجود في الباكيت؟', exists);
+    if (!exists) {
+      return res.status(404).json({ message: 'الصورة غير موجودة في التخزين' });
+    }
+
+    // رابط موقع صالح لأسبوع (7 أيام فقط)
+    const [signedUrl] = await file.getSignedUrl({
+      version: 'v4',
+      action: 'read',
+      expires: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 أيام فقط
+    });
+    console.log('✅ تم توليد الرابط الموقع:', signedUrl);
+
+    res.json({ url: signedUrl });
+  } catch (err) {
+    console.error('❌ Signed URL Error:', err, err.stack);
+    res.status(500).json({ message: 'فشل في توليد الرابط المؤقت', error: err.message });
+  }
+});
+
+
+app.post('/api/articles/:id/toggle-like', verifyToken, async (req, res) => {
+  const userId = req.user.id;
+  const articleId = req.params.id;
+
+  try {
+    const [existingLike] = await query(
+      `SELECT id FROM article_likes WHERE article_id=? AND user_id=?`,
+      [articleId, userId]
+    );
+
+    if (existingLike) {
+      // حذف الإعجاب الموجود
+      await query(`DELETE FROM article_likes WHERE id=?`, [existingLike.id]);
+      res.json({ message: 'تم إلغاء الإعجاب', liked: false });
+    } else {
+      // إضافة إعجاب جديد
+      await query(
+        `INSERT INTO article_likes (article_id, user_id) VALUES (?, ?)`,
+        [articleId, userId]
+      );
+      res.json({ message: 'تم تسجيل الإعجاب', liked: true });
+    }
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء تسجيل الإعجاب' });
+  }
+});
+
+
+app.post('/api/articles/:id/mark-viewed', verifyToken, async (req, res) => {
+  const userId = req.user.id;
+  const articleId = req.params.id;
+
+  try {
+    await query(
+      `INSERT IGNORE INTO article_views (article_id, user_id) VALUES (?, ?)`,
+      [articleId, userId]
+    );
+    res.json({ message: 'تم تسجيل المحتوى كمقروء' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء تسجيل المحتوى كمقروء' });
+  }
+});
+
+app.get('/api/articles/:id/stats', verifyToken, async (req, res) => {
+  const articleId = req.params.id;
+
+  try {
+    const [likesCount] = await query(
+      `SELECT COUNT(*) AS total_likes FROM article_likes WHERE article_id=?`,
+      [articleId]
+    );
+
+    const [viewsCount] = await query(
+      `SELECT COUNT(*) AS total_views FROM article_views WHERE article_id=?`,
+      [articleId]
+    );
+
+    res.json({
+      likes: likesCount.total_likes,
+      views: viewsCount.total_views,
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب إحصائيات المحتوى' });
+  }
+});
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
