@@ -6086,16 +6086,89 @@ app.get('/api/articles/:id/stats', verifyToken, async (req, res) => {
 });
 
 
-app.post('/api/twilio/sms-webhook', express.urlencoded({ extended: false }), (req, res) => {
-  const messageBody = req.body.Body; // نص الرسالة
-  const fromNumber = req.body.From; // رقم المرسل
+app.post('/api/twilio/sms-webhook', express.urlencoded({ extended: false }), async (req, res) => {
+  const messageBody = req.body.Body;
 
-  console.log('📩 Received SMS:', messageBody);
-  console.log('📞 From:', fromNumber);
+  console.log('📩 SMS Received:', messageBody);
 
-  // رد بسيط لتأكيد الاستلام لـ Twilio
-  res.status(200).send('<Response></Response>');
+  const extract = (regex, text) => (text.match(regex) || [])[1]?.trim() || '';
+
+  const contractNumber = extract(/للعقد رقم (\d+)/, messageBody);
+  const amountPaidRaw = extract(/بقيمة ([\d,]+\.\d{2}) ريال/, messageBody);
+
+  console.log('🔍 Extracted contractNumber:', contractNumber);
+  console.log('🔍 Extracted amountPaidRaw:', amountPaidRaw);
+
+  const amountPaid = parseFloat(amountPaidRaw.replace(/,/g, ''));
+
+  if (!contractNumber || isNaN(amountPaid)) {
+    console.log('❌ Extraction failed:', { contractNumber, amountPaid });
+    return res.status(400).send('<Response></Response>');
+  }
+
+  try {
+    console.log('🔎 Querying contract from DB:', contractNumber);
+
+    const [contract] = await query(`
+      SELECT id, tenant_id FROM rental_contracts_details
+      WHERE contract_number LIKE ?
+      LIMIT 1
+    `, [`${contractNumber}%`]);
+
+    if (!contract) {
+      console.log('❌ Contract not found:', contractNumber);
+      return res.status(404).send('<Response></Response>');
+    }
+
+    console.log('✅ Contract found:', contract.id);
+
+    const paymentResult = await query(`
+      UPDATE payments
+      SET payment_status = 'مدفوعة', 
+          paid_date = CURDATE(), 
+          payment_note = 'دفعة مسجلة تلقائيًا بقيمة ${amountPaid}'
+      WHERE contract_id = ? AND payment_status = 'غير مدفوعة'
+      ORDER BY due_date ASC
+      LIMIT 1
+    `, [contract.id]);
+
+    if (paymentResult.affectedRows > 0) {
+      console.log('✅ Payment updated successfully for contract:', contractNumber);
+
+      const [user] = await query(`
+        SELECT fcm_token FROM users 
+        WHERE id = ?
+      `, [contract.tenant_id]);
+
+      if (user && user.fcm_token) {
+        const message = {
+          notification: {
+            title: 'تأكيد الدفع ✅',
+            body: `تم تسجيل دفعتك بقيمة ${amountPaid} ريال بنجاح.`,
+          },
+          token: user.fcm_token,
+        };
+
+        admin.messaging().send(message)
+          .then(() => console.log('✅ Firebase notification sent successfully.'))
+          .catch((err) => console.error('❌ Error sending Firebase notification:', err));
+
+      } else {
+        console.log('⚠️ No valid FCM token for this tenant.');
+      }
+
+    } else {
+      console.log('⚠️ No unpaid payments found for contract:', contractNumber);
+    }
+
+    res.status(200).send('<Response></Response>');
+
+  } catch (err) {
+    console.error('❌ Error during DB operation:', err);
+    res.status(500).send('<Response></Response>');
+  }
 });
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 const PORT = process.env.PORT || 5000;
