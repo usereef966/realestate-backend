@@ -8,7 +8,7 @@ const pdfParse = require('pdf-parse');
 
 
 
-const { query } = require('./database');
+const { pool, query } = require('./database');
 
 const app = express();
 const jwt = require('jsonwebtoken');
@@ -3811,6 +3811,10 @@ app.put('/api/super/articles/:id', verifyToken, async (req, res) => {
   const { id } = req.params;
   const { title, content, type, image_url, start_date, end_date, is_active, is_visible } = req.body;
 
+  if (!['super', 'owner'].includes(req.user.user_type)) {
+    return res.status(403).json({ message: 'غير مصرح لك بتنفيذ هذه العملية' });
+  }
+
   try {
     await query(`
       UPDATE articles_offers_ads
@@ -3825,10 +3829,14 @@ app.put('/api/super/articles/:id', verifyToken, async (req, res) => {
   }
 });
 
-// حذف محتوى
+// إخفاء محتوى
 app.delete('/api/super/articles/:id', verifyToken, async (req, res) => {
   const { id } = req.params;
-  
+
+  if (!['super', 'owner'].includes(req.user.user_type)) {
+    return res.status(403).json({ message: 'غير مصرح لك بتنفيذ هذه العملية' });
+  }
+
   try {
     await query(`UPDATE articles_offers_ads SET is_visible = FALSE WHERE id = ?`, [id]);
     res.json({ message: 'تم إخفاء المحتوى بنجاح' });
@@ -3842,24 +3850,35 @@ app.delete('/api/super/articles/:id', verifyToken, async (req, res) => {
 
 
 
+
 // جلب جميع المحتويات الفعالة
 app.get('/api/articles', verifyToken, async (req, res) => {
   try {
     const today = new Date();
     const articles = await query(`
-      SELECT * FROM articles_offers_ads
-      WHERE is_active = true
-      AND (start_date IS NULL OR start_date <= ?)
-      AND (end_date IS NULL OR end_date >= ?)
-      ORDER BY created_at DESC`,
+      SELECT a.*, GROUP_CONCAT(pi.image_url) AS images
+      FROM articles_offers_ads a
+      LEFT JOIN property_images pi ON a.id = pi.article_id
+      WHERE a.is_active = true
+      AND (a.start_date IS NULL OR a.start_date <= ?)
+      AND (a.end_date IS NULL OR a.end_date >= ?)
+      GROUP BY a.id
+      ORDER BY a.created_at DESC`,
       [today, today]
     );
-    res.json(articles);
+
+    const formattedArticles = articles.map(article => ({
+      ...article,
+      images: article.images ? article.images.split(',') : []
+    }));
+
+    res.json(formattedArticles);
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'حدث خطأ أثناء جلب المحتويات' });
   }
 });
+
 
 // جلب محتوى واحد فعال
 app.get('/api/articles/:id', verifyToken, async (req, res) => {
@@ -3868,13 +3887,23 @@ app.get('/api/articles/:id', verifyToken, async (req, res) => {
 
   try {
     const [article] = await query(`
-      SELECT * FROM articles_offers_ads
-      WHERE id = ?
-      AND is_active = true
-      AND (start_date IS NULL OR start_date <= ?)
-      AND (end_date IS NULL OR end_date >= ?)`,
+      SELECT a.*, GROUP_CONCAT(pi.image_url) AS images
+      FROM articles_offers_ads a
+      LEFT JOIN property_images pi ON a.id = pi.article_id
+      WHERE a.id = ?
+      AND a.is_active = true
+      AND (a.start_date IS NULL OR a.start_date <= ?)
+      AND (a.end_date IS NULL OR a.end_date >= ?)
+      GROUP BY a.id`,
       [id, today, today]
     );
+
+    if (!article) {
+      return res.status(404).json({ message: 'المحتوى غير موجود أو غير فعال' });
+    }
+
+    article.images = article.images ? article.images.split(',') : [];
+
     res.json(article);
   } catch (err) {
     console.error(err);
@@ -6105,6 +6134,403 @@ app.get('/api/articles/:id/stats', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'حدث خطأ أثناء جلب إحصائيات المحتوى' });
   }
 });
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+app.post('/api/rental-units/:id/publish-ad', verifyToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // تحديد تاريخ بداية ونهاية الإعلان (7 أيام من اليوم)
+    const today = new Date();
+    const startDate = today;
+    const endDate = new Date(today);
+    endDate.setDate(today.getDate() + 7);
+
+    // تحقق من وجود إعلان نشط لنفس الشقة خلال الفترة المحددة
+    const [existingAd] = await query(`
+      SELECT id FROM articles_offers_ads
+      WHERE property_id = ?
+        AND type = 'ad'
+        AND is_active = 1
+        AND is_visible = 1
+        AND (
+          (start_date <= ? AND end_date >= ?)
+          OR (start_date BETWEEN ? AND ?)
+          OR (end_date BETWEEN ? AND ?)
+        )
+    `, [
+      id,
+      endDate, startDate,
+      startDate, endDate,
+      startDate, endDate
+    ]);
+
+    if (existingAd) {
+      return res.status(400).json({ message: 'يوجد إعلان نشط لهذه الوحدة في نفس الفترة بالفعل.' });
+    }
+
+    // جلب تفاصيل الوحدة
+    const [unit] = await query('SELECT * FROM rental_units WHERE id = ?', [id]);
+    if (!unit) {
+      return res.status(404).json({ message: 'الوحدة غير موجودة' });
+    }
+
+    // إنشاء الإعلان الجديد
+    const insertResult = await query(`
+      INSERT INTO articles_offers_ads 
+      (title, content, type, price, rooms, area, amenities, contact_info, property_id, start_date, end_date, created_by)
+      VALUES (?, ?, 'ad', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      unit.title,
+      unit.description,
+      unit.price,
+      unit.rooms,
+      unit.area,
+      unit.amenities,
+      unit.contact_info,
+      unit.id,
+      startDate,
+      endDate,
+      req.user.id
+    ]);
+
+    const articleId = insertResult.insertId;
+
+    // تحديث حالة الوحدة إلى "تم نشر إعلان"
+    await query('UPDATE rental_units SET is_published_ad = 1 WHERE id = ?', [id]);
+
+    // جلب توكنات FCM للمستخدمين
+    const usersFCM = await query('SELECT id AS user_id, fcm_token FROM users WHERE user_type = ?', ['user']);
+    const accessToken = await getAccessToken();
+
+    for (const user of usersFCM) {
+      if (!user.fcm_token) continue;
+
+      const notificationMessage = {
+        message: {
+          token: user.fcm_token,
+          notification: {
+            title: 'إعلان جديد 🏠',
+            body: `تم نشر إعلان جديد: ${unit.title}`,
+          },
+          data: {
+            screen: 'articles',
+            articleId: String(articleId),
+            userId: String(user.user_id),
+            userType: 'user',
+            senderType: 'admin'
+          }
+        }
+      };
+
+      await fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationMessage),
+        }
+      );
+
+      await query(`
+        INSERT INTO notifications (user_id, title, body)
+        VALUES (?, ?, ?)
+      `, [user.user_id, 'إعلان جديد 🏠', `تم نشر إعلان جديد: ${unit.title}`]);
+    }
+
+    res.status(201).json({ message: 'تم نشر الإعلان بنجاح', articleId });
+
+  } catch (err) {
+    console.error('❌ خطأ في نشر الإعلان:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء نشر الإعلان' });
+  }
+});
+
+
+
+
+// استيراد الـ pool من ملف database.js
+
+
+app.post('/api/rental-units/create', verifyToken, async (req, res) => {
+  const {
+    title, description, price, rooms, area, amenities,
+    contact_info, imageFileNames
+  } = req.body;
+
+  try {
+    // إضافة الشقة
+    const result = await query(`
+      INSERT INTO rental_units 
+      (title, description, price, rooms, area, amenities, contact_info, created_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [
+        title,
+        description,
+        price || null,
+        rooms || null,
+        area || null,
+        amenities || null,
+        contact_info || null,
+        req.user.id
+      ]
+    );
+
+    const rentalUnitId = result.insertId;
+
+    // ربط الصور إذا موجودة
+   if (imageFileNames && imageFileNames.length > 0) {
+  const imageInserts = imageFileNames.map(img => [rentalUnitId, img]);
+  await pool.query(
+    'INSERT INTO property_images (unit_id, image_url) VALUES ?',
+    [imageInserts]
+  );
+}
+
+
+    res.status(201).json({ 
+      message: 'تم إضافة الشقة بنجاح', 
+      rentalUnitId 
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء إضافة الشقة' });
+  }
+});
+
+
+
+app.get('/api/rental-units', verifyToken, async (req, res) => {
+  try {
+    const units = await query(`
+      SELECT id, title, description, rooms, area, price
+      FROM rental_units
+      WHERE is_published_ad = 0
+      ORDER BY created_at DESC
+    `);
+    res.json(units);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب الوحدات' });
+  }
+});
+
+
+app.get('/api/rental-units/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const [unit] = await query(`
+      SELECT * FROM rental_units WHERE id = ?
+    `, [id]);
+
+    if (!unit) {
+      return res.status(404).json({ message: 'الوحدة غير موجودة' });
+    }
+
+    const images = await query(`
+      SELECT image_url FROM property_images WHERE unit_id = ?
+    `, [id]);
+
+    unit.images = images.map(img => img.image_url.replace(/^articles\//, '')); // في حال فيه مسار قديم
+
+    res.json(unit);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب تفاصيل الوحدة' });
+  }
+});
+
+
+app.put('/api/rental-units/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const {
+    title, description, price, rooms, area, amenities,
+    contact_info, imageFileNames
+  } = req.body;
+
+  try {
+    await query(`
+      UPDATE rental_units SET
+        title = ?,
+        description = ?,
+        price = ?,
+        rooms = ?,
+        area = ?,
+        amenities = ?,
+        contact_info = ?,
+        updated_at = NOW()
+      WHERE id = ?`,
+      [
+        title,
+        description,
+        price || null,
+        rooms || null,
+        area || null,
+        amenities || null,
+        contact_info || null,
+        id
+      ]
+    );
+
+    // حذف الصور القديمة وإضافة الجديدة
+    await query(`DELETE FROM property_images WHERE unit_id = ?`, [id]);
+
+  if (imageFileNames && imageFileNames.length > 0) {
+  const imageInserts = imageFileNames.map(img => [id, img]);
+  await pool.query(
+    'INSERT INTO property_images (unit_id, image_url) VALUES ?',
+    [imageInserts]
+  );
+}
+    // جلب بيانات الشقة المحدّثة
+    const [unit] = await query(`SELECT * FROM rental_units WHERE id = ?`, [id]);
+    const images = await query(`SELECT image_url FROM property_images WHERE unit_id = ?`, [id]);
+    unit.images = images.map(img => img.image_url);
+
+    // إذا منشور لها إعلان، جيب آخر إعلان
+    let ad = null;
+    if (unit.is_published_ad) {
+      const [adRow] = await query(`
+        SELECT * FROM articles_offers_ads 
+        WHERE property_id = ? 
+        ORDER BY created_at DESC 
+        LIMIT 1
+      `, [id]);
+      ad = adRow || null;
+    }
+
+    res.json({
+      message: 'تم تحديث بيانات الشقة بنجاح',
+      unit,
+      ad
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء تحديث الشقة' });
+  }
+});
+
+
+
+app.delete('/api/ads/:adId', verifyToken, async (req, res) => {
+  const { adId } = req.params;
+
+  try {
+    // 1. حذف مشاهدات وإعجابات الإعلان
+    await query('DELETE FROM article_views WHERE article_id = ?', [adId]);
+    await query('DELETE FROM article_likes WHERE article_id = ?', [adId]);
+
+    // 2. تحديث حالة الإعلان ليصبح غير نشط وغير ظاهر
+    await query('UPDATE articles_offers_ads SET is_active = 0, is_visible = 0 WHERE id = ?', [adId]);
+
+    // 3. تحديث حالة الشقة المرتبطة ليصبح is_published_ad = 0
+    await query(`
+      UPDATE rental_units ru
+      JOIN articles_offers_ads a ON ru.id = a.property_id
+      SET ru.is_published_ad = 0
+      WHERE a.id = ?
+    `, [adId]);
+
+    res.json({ message: 'تم إلغاء تفعيل الإعلان بنجاح' });
+  } catch (err) {
+     console.error('❌ Delete ad error:', err); // <-- اطبع الخطأ هنا
+    res.status(500).json({ message: 'حدث خطأ أثناء حذف الإعلان' });
+  }
+});
+
+
+// حذف فعلي كامل للإعلان وكل ما يتعلق به
+// حذف فعلي كامل للشقة وكل ما يتعلق بها
+app.delete('/api/rental-units/:unitId/permanent', verifyToken, async (req, res) => {
+  const { unitId } = req.params;
+
+  try {
+    // 1. حذف الصور المرتبطة بالشقة
+    await query('DELETE FROM property_images WHERE unit_id = ?', [unitId]);
+
+    // 2. حذف كل الإعلانات المرتبطة بالشقة
+    const ads = await query('SELECT id FROM articles_offers_ads WHERE property_id = ?', [unitId]);
+    for (const ad of ads) {
+      await query('DELETE FROM article_views WHERE article_id = ?', [ad.id]);
+      await query('DELETE FROM article_likes WHERE article_id = ?', [ad.id]);
+    }
+    await query('DELETE FROM articles_offers_ads WHERE property_id = ?', [unitId]);
+
+    // 3. حذف الشقة نفسها
+    await query('DELETE FROM rental_units WHERE id = ?', [unitId]);
+
+    res.json({ message: 'تم حذف الشقة وكل ما يتعلق بها نهائياً' });
+  } catch (err) {
+    console.error('❌ Permanent Delete unit error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء الحذف النهائي للشقة' });
+  }
+});
+
+
+
+
+app.get('/api/active-ads', verifyToken, async (req, res) => {
+  try {
+    const today = new Date();
+    const todayStr = today.toISOString().slice(0, 10);
+
+    const ads = await query(`
+      SELECT 
+        a.id,
+        a.title,
+        a.content,
+        a.type,
+        a.price,
+        a.rooms,
+        a.area,
+        a.amenities,
+        a.contact_info,
+        a.property_id,
+        a.start_date,
+        a.end_date,
+        a.created_by,
+        a.created_at,
+        a.is_active,
+        a.is_visible,
+        ru.title AS unit_title,
+        ru.description AS unit_description,
+        ru.price AS unit_price,
+        ru.rooms AS unit_rooms,
+        ru.area AS unit_area,
+        ru.amenities AS unit_amenities,
+        ru.contact_info AS unit_contact_info,
+        ru.id AS unit_id,
+        GROUP_CONCAT(pi.image_url) AS images
+      FROM articles_offers_ads a
+      LEFT JOIN rental_units ru ON a.property_id = ru.id
+      LEFT JOIN property_images pi ON pi.unit_id = ru.id
+      WHERE a.type = 'ad'
+        AND a.is_active = 1
+        AND (a.is_visible IS NULL OR a.is_visible = 1)
+        AND (a.start_date IS NULL OR a.start_date <= ?)
+        AND (a.end_date IS NULL OR a.end_date >= ?)
+      GROUP BY a.id
+      ORDER BY a.created_at DESC
+    `, [todayStr, todayStr]);
+
+   const formatted = ads.map(ad => ({
+  ...ad,
+  images: ad.images
+    ? ad.images.split(',').map(img => img.replace(/^articles\//, '')) // شيل 'articles/' من أول الاسم
+    : []
+}));
+
+    res.json(formatted);
+  } catch (err) {
+    console.error('❌ /api/active-ads Error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب الإعلانات الفعالة' });
+  }
+});
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 app.post('/api/admin/update-payment-status', verifyToken, async (req, res) => {
@@ -6208,6 +6634,351 @@ app.post('/api/admin/update-payment-status', verifyToken, async (req, res) => {
   }
 });
 
+
+
+app.get('/api/payments/active-tenants', verifyToken, async (req, res) => {
+  const adminId = req.user.id;
+
+  try {
+    const tenants = await query(`
+      SELECT 
+        u.user_id AS tenant_id,
+        MAX(rcd.tenant_name) AS name,
+        MAX(rcd.unit_number) AS unit_number
+      FROM rental_contracts_details rcd
+      JOIN users u ON u.id = rcd.tenant_id
+      WHERE rcd.admin_id = ? AND rcd.contract_end >= CURDATE()
+      GROUP BY u.user_id
+    `, [adminId]);
+
+    res.json({ tenants });
+  } catch (err) {
+    console.error('❌ Error fetching active tenants:', err);
+    res.status(500).json({ message: 'خطأ في جلب المستأجرين' });
+  }
+});
+
+
+app.get('/api/payments/tenant/:tenantId', verifyToken, async (req, res) => {
+  const { tenantId } = req.params;
+
+  try {
+    const payments = await query(`
+      SELECT 
+        p.id AS payment_id,
+        p.payment_number,
+        p.payment_amount,
+        p.due_date,
+        p.payment_status,
+        p.paid_date,
+        p.payment_note
+      FROM payments p
+      JOIN rental_contracts_details rcd ON p.contract_id = rcd.id
+      WHERE rcd.tenant_id = (SELECT id FROM users WHERE user_id = ?)
+      ORDER BY p.due_date ASC
+    `, [tenantId]);
+
+    res.json({ payments });
+  } catch (err) {
+    console.error('❌ Error fetching tenant payments:', err);
+    res.status(500).json({ message: 'خطأ في جلب الدفعات' });
+  }
+});
+
+
+app.put('/api/payments/update/:paymentId', verifyToken, async (req, res) => {
+  const { paymentId } = req.params;
+  const { payment_status, paid_date, payment_note } = req.body;
+
+  try {
+    await query(`
+      UPDATE payments 
+      SET payment_status = ?, paid_date = ?, payment_note = ?
+      WHERE id = ?
+    `, [payment_status, paid_date, payment_note, paymentId]);
+
+    res.json({ message: '✅ تم تحديث الدفعة بنجاح' });
+  } catch (err) {
+    console.error('❌ Error updating payment:', err);
+    res.status(500).json({ message: 'خطأ في تحديث بيانات الدفعة' });
+  }
+});
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+app.get('/api/admin/expenses/types/:adminId', verifyToken, async (req, res) => {
+  const adminId = req.params.adminId;
+
+  const sql = `
+    SELECT et.id AS type_id,
+           COALESCE(uet.custom_name, et.name) AS expense_name,
+           IF(uet.user_id IS NULL, FALSE, TRUE) AS is_selected
+    FROM expenses_types et
+    LEFT JOIN user_expenses_types uet ON et.id = uet.type_id AND uet.user_id = ?
+  `;
+
+  try {
+    const types = await query(sql, [adminId]);
+    res.json({ types });
+  } catch (err) {
+    console.error('Error fetching expense types:', err);
+    res.status(500).json({ message: 'خطأ في جلب أنواع المصروفات' });
+  }
+});
+
+
+app.post('/api/admin/expenses/types', verifyToken, async (req, res) => {
+  const { adminId, selectedTypes } = req.body; // selectedTypes = [{type_id, custom_name}]
+
+  if (!adminId || !Array.isArray(selectedTypes)) {
+    return res.status(400).json({ message: 'بيانات غير صحيحة' });
+  }
+
+  try {
+    // حذف الاختيارات السابقة
+    await query('DELETE FROM user_expenses_types WHERE user_id = ?', [adminId]);
+
+    // إدخال الاختيارات الجديدة
+    const insertPromises = selectedTypes.map(type =>
+      query(
+        'INSERT INTO user_expenses_types (user_id, type_id, custom_name) VALUES (?, ?, ?)',
+        [adminId, type.type_id, type.custom_name || null]
+      )
+    );
+
+    await Promise.all(insertPromises);
+    res.json({ message: 'تم حفظ الاختيارات بنجاح' });
+  } catch (err) {
+    console.error('Error saving expense types:', err);
+    res.status(500).json({ message: 'خطأ في حفظ أنواع المصروفات' });
+  }
+});
+
+
+app.get('/api/admin/selected-expenses-types/:adminId', verifyToken, async (req, res) => {
+  const adminId = req.params.adminId;
+
+const sql = `
+ SELECT 
+  et.id AS type_id,
+  COALESCE(uet.custom_name, et.name) AS expense_name,
+  ee.frequency,
+  ee.amount,
+  ee.note
+FROM expenses_types et
+INNER JOIN user_expenses_types uet ON et.id = uet.type_id
+LEFT JOIN (
+  SELECT e1.type_id, e1.amount, e1.note, e1.frequency
+  FROM expenses_entries e1
+  INNER JOIN (
+    SELECT type_id, MAX(id) AS max_id
+    FROM expenses_entries
+    WHERE user_id = ?
+    GROUP BY type_id
+  ) e2 ON e1.type_id = e2.type_id AND e1.id = e2.max_id
+  WHERE e1.user_id = ?
+) ee ON ee.type_id = uet.type_id
+WHERE uet.user_id = ?;
+`;
+
+  try {
+    const selectedTypes = await query(sql, [adminId, adminId, adminId]);
+    console.log('🔵 [selected-expenses-types] selectedTypes:', selectedTypes); // <--- هنا
+    res.json({ selectedTypes });
+  } catch (err) {
+    console.error('Error fetching selected expense types:', err);
+    res.status(500).json({ message: 'خطأ في جلب الأنواع المختارة' });
+  }
+});
+
+app.post('/api/admin/expenses-entries', verifyToken, async (req, res) => {
+  const { userId, entries } = req.body;
+
+  if (!userId || !Array.isArray(entries) || entries.length === 0) {
+    return res.status(400).json({ message: 'بيانات غير صحيحة.' });
+  }
+
+  try {
+    console.log('🟡 [expenses-entries] Received entries:', entries); // <--- هنا
+    const upsertPromises = entries.map(entry =>
+      query(
+        `INSERT INTO expenses_entries (user_id, type_id, amount, frequency, note)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE 
+           amount = VALUES(amount),
+           frequency = VALUES(frequency),
+           note = VALUES(note)`,
+        [userId, entry.type_id, entry.amount, entry.frequency, entry.note || null]
+      )
+    );
+
+    await Promise.all(upsertPromises);
+    const check = await query('SELECT * FROM expenses_entries WHERE user_id = ?', [userId]);
+    console.log('🟢 [expenses-entries] DB after save:', check); // <--- هنا
+    res.json({ message: 'تم حفظ الإدخالات بنجاح' });
+  } catch (err) {
+    console.error('Error saving expenses entries:', err);
+    res.status(500).json({ message: 'خطأ في حفظ الإدخالات' });
+  }
+});
+
+
+
+
+
+
+
+app.post('/api/admin/expenses', verifyToken, async (req, res) => {
+  const { adminId, typeId, amount, expenseDate, notes } = req.body;
+
+  if (!adminId || !typeId || !amount || !expenseDate) {
+    return res.status(400).json({ message: 'كل الحقول مطلوبة ما عدا الملاحظات' });
+  }
+
+  const sql = `
+    INSERT INTO expenses (user_id, type_id, amount, expense_date, notes)
+    VALUES (?, ?, ?, ?, ?)
+  `;
+
+  try {
+    await query(sql, [adminId, typeId, amount, expenseDate, notes || null]);
+    res.json({ message: 'تمت إضافة المصروف بنجاح' });
+  } catch (err) {
+    console.error('Error adding expense:', err);
+    res.status(500).json({ message: 'خطأ في إضافة المصروف' });
+  }
+});
+
+
+app.put('/api/admin/expenses/:expenseId', verifyToken, async (req, res) => {
+  const expenseId = req.params.expenseId;
+  const { typeId, amount, expenseDate, notes } = req.body;
+
+  if (!typeId || !amount || !expenseDate) {
+    return res.status(400).json({ message: 'كل الحقول مطلوبة ما عدا الملاحظات' });
+  }
+
+  const sql = `
+    UPDATE expenses
+    SET type_id = ?, amount = ?, expense_date = ?, notes = ?
+    WHERE id = ?
+  `;
+
+  try {
+    await query(sql, [typeId, amount, expenseDate, notes || null, expenseId]);
+    res.json({ message: 'تم تعديل المصروف بنجاح' });
+  } catch (err) {
+    console.error('Error updating expense:', err);
+    res.status(500).json({ message: 'خطأ في تعديل المصروف' });
+  }
+});
+
+
+
+app.delete('/api/admin/expenses/:expenseId', verifyToken, async (req, res) => {
+  const expenseId = req.params.expenseId;
+
+  try {
+    await query('DELETE FROM expenses WHERE id = ?', [expenseId]);
+    res.json({ message: 'تم حذف المصروف بنجاح' });
+  } catch (err) {
+    console.error('Error deleting expense:', err);
+    res.status(500).json({ message: 'خطأ في حذف المصروف' });
+  }
+});
+
+
+app.get('/api/admin/expenses-report/:adminId', verifyToken, async (req, res) => {
+  const adminId = req.params.adminId;
+
+  const sql = `
+    SELECT et.id AS type_id,
+           COALESCE(uet.custom_name, et.name) AS expense_name,
+           SUM(e.amount) AS total_amount,
+           COUNT(e.id) AS expense_count
+    FROM expenses e
+    JOIN expenses_types et ON e.type_id = et.id
+    LEFT JOIN user_expenses_types uet ON uet.type_id = et.id AND uet.user_id = e.user_id
+    WHERE e.user_id = ?
+    GROUP BY e.type_id, expense_name
+    ORDER BY total_amount DESC
+  `;
+
+  try {
+    const report = await query(sql, [adminId]);
+    res.json({ report });
+  } catch (err) {
+    console.error('Error generating report:', err);
+    res.status(500).json({ message: 'خطأ في توليد التقرير' });
+  }
+});
+
+
+
+
+app.get('/api/admin/expenses-stats/:adminId', verifyToken, async (req, res) => {
+  const adminId = req.params.adminId;
+
+  console.log('🔵 [expenses-stats] adminId:', adminId);
+
+  const sql = `
+SELECT
+  et.id AS type_id,
+  COALESCE(uet.custom_name, et.name) AS expense_name,
+  ee.frequency,
+  ee.amount,
+  ee.note,
+  DATE_FORMAT(ee.entry_date, '%Y-%m-%d') AS last_updated
+FROM expenses_types et
+INNER JOIN user_expenses_types uet ON et.id = uet.type_id
+LEFT JOIN (
+  SELECT e1.*
+  FROM expenses_entries e1
+  INNER JOIN (
+    SELECT type_id, MAX(id) AS max_id
+    FROM expenses_entries
+    WHERE user_id = ?
+    GROUP BY type_id
+  ) e2 ON e1.type_id = e2.type_id AND e1.id = e2.max_id
+  WHERE e1.user_id = ?
+) ee ON ee.type_id = uet.type_id
+WHERE uet.user_id = ?
+ORDER BY ee.frequency;
+  `;
+
+  try {
+    console.log('🟡 [expenses-stats] SQL:', sql);
+    const results = await query(sql, [adminId, adminId, adminId]);
+    console.log('🟢 [expenses-stats] Raw Results:', results);
+
+    const stats = {
+      daily: [],
+      monthly: [],
+      yearly: [],
+    };
+
+    results.forEach((row, idx) => {
+      const formattedRow = {
+        type_id: row.type_id,
+        name: row.expense_name,
+        amount: parseFloat(row.amount),
+        note: row.note,
+        last_updated: row.last_updated,
+      };
+      console.log(`🟠 [expenses-stats] Row #${idx}:`, row);
+      console.log(`🔵 [expenses-stats] Formatted Row #${idx}:`, formattedRow);
+
+      if (row.frequency === 'daily') stats.daily.push(formattedRow);
+      else if (row.frequency === 'monthly') stats.monthly.push(formattedRow);
+      else if (row.frequency === 'yearly') stats.yearly.push(formattedRow);
+    });
+
+    console.log('🟣 [expenses-stats] Final Stats:', stats);
+
+    res.json(stats);
+  } catch (err) {
+    console.error('❌ Error fetching expense stats:', err);
+    res.status(500).json({ message: 'خطأ في جلب إحصائيات المصروفات' });
+  }
+});
 
 
 
