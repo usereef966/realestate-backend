@@ -5,10 +5,12 @@ require('dotenv').config();
 const fetch = require('node-fetch');
 const pdfParse = require('pdf-parse');
 
-
+const PDFDocument = require('pdfkit');
 
 
 const { pool, query } = require('./database');
+
+
 
 const app = express();
 const jwt = require('jsonwebtoken');
@@ -78,6 +80,26 @@ function verifyToken(req, res, next) {
   });
 }
 
+const sendWhatsAppMessage = require('./whatsapp');
+
+
+
+const cron = require('node-cron');
+const { exec } = require('child_process');
+
+// شغل السكربت يوميًا الساعة 9 صباحًا
+cron.schedule('0 9 * * *', () => {
+  exec('node notify-expiring-tenants.js', (err, stdout, stderr) => {
+    if (err) {
+      console.error(`❌ خطأ في تشغيل السكربت التلقائي: ${stderr}`);
+    } else {
+      console.log(`✅ تم تشغيل السكربت التلقائي بنجاح: ${stdout}`);
+    }
+  });
+});
+
+console.log('🔄 تم تفعيل التشغيل التلقائي للسكربتات بنجاح.');
+
 
 
 // Login Endpoint (بدون حماية)
@@ -104,6 +126,19 @@ app.post('/api/login', async (req, res) => {
 
       if (subResults.length === 0) {
         return res.status(403).json({ message: 'انتهى اشتراك المالك أو غير موجود' });
+      }
+
+      return sendLoginSuccess(res, user);
+    }
+
+    if (user.user_type === 'viewer') { // 👈 إضافة التحقق من viewer هنا
+      const subResults = await query(
+        `SELECT 1 FROM admin_subscriptions WHERE admin_id = ? AND end_date >= CURDATE() LIMIT 1`,
+        [user.id]
+      );
+
+      if (subResults.length === 0) {
+        return res.status(403).json({ message: 'انتهى اشتراك الـ Viewer أو غير موجود' });
       }
 
       return sendLoginSuccess(res, user);
@@ -244,6 +279,30 @@ app.post('/api/validate-user', verifyToken, async (req, res) => {
 });
 
 
+app.post('/api/validate-viewer', verifyToken, async (req, res) => {
+  const { userId } = req.body;
+
+  try {
+    const [user] = await query(`
+      SELECT u.user_id
+      FROM users u
+      JOIN admin_subscriptions s ON s.admin_id = u.id
+      WHERE u.user_id = ? AND u.user_type = 'viewer' AND s.status = 'active' AND s.end_date >= CURDATE()
+    `, [userId]);
+
+    if (user) {
+      return res.json({ valid: true });
+    }
+
+    res.json({ valid: false });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ valid: false, error });
+  }
+});
+
+
+
 app.put('/api/admin/update-name', verifyToken, async (req, res) => {
   const { userType, id: adminId } = req.user;
   const { name } = req.body;
@@ -282,11 +341,21 @@ app.get('/api/admin-token-count/:adminId', verifyToken, async (req, res) => {
 
 
 
+
+
 app.post('/api/get-admin-details', verifyToken, async (req, res) => {
   const { userId } = req.body;
 
   const sql = `
-    SELECT u.user_id, u.name, u.user_type
+    SELECT 
+      u.user_id, 
+      u.name, 
+      u.user_type, 
+      u.viewer_id,
+      s.subscription_type,
+      s.start_date,
+      s.end_date,
+      s.status
     FROM users u
     INNER JOIN admin_subscriptions s ON u.id = s.admin_id
     WHERE u.id = ?;
@@ -299,7 +368,24 @@ app.post('/api/get-admin-details', verifyToken, async (req, res) => {
       return res.status(404).json({ message: 'Admin not found' });
     }
 
-    res.json({ admin: results[0] });
+    const admin = results[0];
+
+    // تحديد الارتباط بشكل واضح
+    const isLinkedToViewer = admin.viewer_id !== null;
+
+    res.json({ 
+      admin: {
+        user_id: admin.user_id,
+        name: admin.name,
+        user_type: admin.user_type,
+        linked_viewer_id: admin.viewer_id,
+        subscription_type: admin.subscription_type,
+        start_date: admin.start_date,
+        end_date: admin.end_date,
+        status: admin.status,
+        isLinkedToViewer
+      } 
+    });
 
   } catch (err) {
     console.error('❌ Get-admin-details Error:', err);
@@ -307,29 +393,6 @@ app.post('/api/get-admin-details', verifyToken, async (req, res) => {
   }
 });
 
-app.post('/api/get-user-details', verifyToken, async (req, res) => {
-  const { userId } = req.body;
-
-  const sql = `
-    SELECT u.user_id, u.name, u.email, r.contract_start, r.contract_end
-    FROM users u
-    INNER JOIN rental_contracts r ON u.id = r.tenant_id
-    WHERE u.user_id = ?;
-  `;
-
-  try {
-    const results = await query(sql, [userId]);
-
-    if (results.length === 0) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    res.json({ user: results[0] });
-  } catch (err) {
-    console.error('❌ Get-user-details Error:', err);
-    res.status(500).json({ message: 'خطأ داخلي في الخادم' });
-  }
-});
 
 
 app.get('/api/admin-token/:adminId', verifyToken, async (req, res) => {
@@ -390,8 +453,8 @@ app.post('/api/generate-user-token', verifyToken, async (req, res) => {
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
+////// Create Admin Functions /////
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 app.post('/api/create-admin', verifyToken, async (req, res) => {
   const { userType, id: created_by } = req.user;
 
@@ -399,17 +462,43 @@ app.post('/api/create-admin', verifyToken, async (req, res) => {
     return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه إنشاء مالك.' });
   }
 
-  const { user_id, name, permissions = {} } = req.body;
+  const { user_id, name, phone_number, email, subscription_type, tenant_limit, permissions = {} } = req.body;
 
-  if (!user_id || !name) {
-    return res.status(400).json({ message: '❗ user_id و name مطلوبة.' });
+  if (!user_id || !name || !phone_number || !subscription_type || tenant_limit === undefined) {
+    return res.status(400).json({ message: '❗ الحقول user_id, name, phone_number, subscription_type, tenant_limit مطلوبة.' });
   }
 
-  const token = crypto.randomBytes(32).toString('hex');
+  if (!/^[0-9]+$/.test(user_id)) {
+    return res.status(400).json({ message: '❗ user_id يجب أن يكون أرقام فقط.' });
+  }
+
+  // ✅ التحقق الجديد من تكرار user_id
+  const existingUserCheck = await query(`SELECT id FROM users WHERE user_id = ? LIMIT 1`, [user_id]);
+  if (existingUserCheck.length > 0) {
+    return res.status(400).json({ message: '❗ رقم المستخدم (user_id) موجود بالفعل، الرجاء اختيار رقم مختلف.' });
+  }
+
+  const token = Math.floor(10000000 + Math.random() * 90000000).toString();
+
+  let subscription_start_date = new Date();
+  let subscription_end_date;
+
+  if (subscription_type === 'monthly') {
+    subscription_end_date = new Date(subscription_start_date);
+    subscription_end_date.setMonth(subscription_end_date.getMonth() + 1);
+  } else if (subscription_type === 'yearly') {
+    subscription_end_date = new Date(subscription_start_date);
+    subscription_end_date.setFullYear(subscription_end_date.getFullYear() + 1);
+  } else {
+    return res.status(400).json({ message: '❗ نوع الاشتراك غير صالح (monthly, yearly).' });
+  }
+
+  const startDateSql = subscription_start_date.toISOString().slice(0,10);
+  const endDateSql = subscription_end_date.toISOString().slice(0,10);
 
   const insertUserSql = `
-    INSERT INTO users (user_id, name, user_type, token, created_at)
-    VALUES (?, ?, 'admin', ?, NOW())
+    INSERT INTO users (user_id, name, user_type, token, phone_number, created_by, created_at)
+    VALUES (?, ?, 'admin', ?, ?, ?, NOW())
   `;
 
   const insertTokenSql = `
@@ -417,25 +506,482 @@ app.post('/api/create-admin', verifyToken, async (req, res) => {
     VALUES (?, ?, ?)
   `;
 
-  try {
-    // إدخال بيانات المستخدم (admin)
-    const userResult = await query(insertUserSql, [user_id, name, token]);
+const insertSubscriptionSql = `
+  INSERT INTO admin_subscriptions (admin_id, start_date, end_date, status, tenant_limit, subscription_type)
+  VALUES (?, ?, ?, 'active', ?, ?)
+`;
 
-    // إدخال التوكن والصلاحيات
+  
+
+  try {
+    const userResult = await query(insertUserSql, [user_id, name, token, phone_number, created_by]);
+    const adminId = userResult.insertId;
+
     await query(insertTokenSql, [token, JSON.stringify(permissions), created_by]);
+    await query(insertSubscriptionSql, [adminId, startDateSql, endDateSql, tenant_limit, subscription_type]);
+    // إدراج سجل review_permissions مباشرة بعد إنشاء المستخدم
+await query(`
+  INSERT INTO review_permissions (admin_id, enabled) VALUES (?, 1)
+`, [adminId]);
+
+
+    // ✅ إرسال رسالة WhatsApp
+    const formattedPhone = phone_number.replace('+', '');
+    const whatsappMessage = `
+    أهلاً ${name} 👋،
+
+    تم إنشاء حسابك بنجاح 🎉
+
+    تفاصيل اشتراكك:
+    - نوع الاشتراك: ${subscription_type === 'monthly' ? 'شهري' : 'سنوي'}
+    - بداية الاشتراك: ${startDateSql}
+    - نهاية الاشتراك: ${endDateSql}
+    - عدد المستأجرين المسموح لك إضافتهم: ${tenant_limit}
+
+    رمز الدخول الخاص بك: ${token}
+
+    شكرًا لاستخدام منصتنا 🌟
+    `;
+
+    await sendWhatsAppMessage(formattedPhone, whatsappMessage.trim());
 
     res.json({
-      message: '✅ تم إنشاء المالك والتوكن بنجاح.',
-      adminId: userResult.insertId,
-      token
+      message: '✅ تم إنشاء المالك والتوكن والاشتراك وإرسال تفاصيل الاشتراك بنجاح.',
+      adminId,
+      token,
+      subscription_start_date: startDateSql,
+      subscription_end_date: endDateSql,
+      tenant_limit
     });
 
   } catch (err) {
     console.error('❌ Create-admin Error:', err);
-    res.status(500).json({ message: 'حدث خطأ أثناء إنشاء المالك أو التوكن.' });
+    res.status(500).json({ message: 'حدث خطأ أثناء إنشاء المالك أو التوكن أو الاشتراك أو إرسال الرسالة.' });
   }
 });
 
+
+app.get('/api/active-subscriptions', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه الوصول لهذه البيانات.' });
+  }
+
+  const sql = `
+    SELECT 
+      u.id AS admin_id,
+      u.name,
+      u.user_id,
+      u.phone_number,
+      s.start_date,
+      s.end_date
+    FROM admin_subscriptions s
+    JOIN users u ON s.admin_id = u.id
+    WHERE s.status = 'active'
+      AND s.end_date >= CURDATE()
+      AND u.user_type = 'admin'
+      AND u.viewer_id IS NULL
+    ORDER BY s.end_date ASC
+  `;
+
+  try {
+    const activeSubscriptions = await query(sql);
+    
+    res.json({ 
+      activeSubscriptionsCount: activeSubscriptions.length,
+      subscriptions: activeSubscriptions 
+    });
+
+  } catch (err) {
+    console.error('❌ Error fetching active subscriptions:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب الاشتراكات الفعالة.' });
+  }
+});
+
+
+
+app.get('/api/expired-subscriptions', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه الوصول لهذه البيانات.' });
+  }
+
+  const sql = `
+    SELECT 
+      u.id AS admin_id,
+      u.name,
+      u.user_id,
+      u.phone_number,
+      s.start_date,
+      s.end_date
+    FROM admin_subscriptions s
+    JOIN users u ON s.admin_id = u.id
+    WHERE s.status = 'expired' OR s.end_date < CURDATE()
+    ORDER BY s.end_date DESC
+  `;
+
+  try {
+    const expiredSubscriptions = await query(sql);
+    
+    res.json({ 
+      expiredSubscriptionsCount: expiredSubscriptions.length,
+      subscriptions: expiredSubscriptions 
+    });
+
+  } catch (err) {
+    console.error('❌ Error fetching expired subscriptions:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب الاشتراكات المنتهية.' });
+  }
+});
+
+
+app.post('/api/subscriptions/:adminId/renew', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { adminId } = req.params;
+  const { subscription_type } = req.body;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه تجديد الاشتراك.' });
+  }
+
+  try {
+    const [currentSub] = await query(
+      `SELECT id, end_date FROM admin_subscriptions WHERE admin_id = ?`, 
+      [adminId]
+    );
+
+    let currentEndDate = currentSub?.end_date ? new Date(currentSub.end_date) : new Date();
+
+    if (currentEndDate < new Date()) {
+      currentEndDate = new Date();
+    }
+
+    let newEndDate;
+
+    if (subscription_type === 'monthly') {
+      newEndDate = new Date(currentEndDate);
+      newEndDate.setMonth(newEndDate.getMonth() + 1);
+    } else if (subscription_type === 'yearly') {
+      newEndDate = new Date(currentEndDate);
+      newEndDate.setFullYear(newEndDate.getFullYear() + 1);
+    } else {
+      return res.status(400).json({ message: 'نوع الاشتراك غير صالح.' });
+    }
+
+    const formattedEndDate = newEndDate.toISOString().slice(0, 10);
+
+    // تحديث اشتراك الـ Viewer
+    const sql = `
+      UPDATE admin_subscriptions
+      SET start_date = CURDATE(), end_date = ?, status = 'active', subscription_type = ?
+      WHERE admin_id = ?
+    `;
+
+    await query(sql, [formattedEndDate, subscription_type, adminId]);
+
+    // تحديث اشتراكات الوكلاء المرتبطة بهذا الاشتراك
+    const updateLinkedAgentsSql = `
+      UPDATE admin_subscriptions
+      SET start_date = CURDATE(), end_date = ?, status = 'active', subscription_type = ?
+      WHERE linked_subscription_id = ?
+    `;
+
+    await query(updateLinkedAgentsSql, [formattedEndDate, subscription_type, currentSub.id]);
+
+    // بيانات المستخدم لإرسال الإشعار
+    const [adminData] = await query(`SELECT name, phone_number FROM users WHERE id = ?`, [adminId]);
+
+    if (adminData && adminData.phone_number) {
+      const formattedPhone = adminData.phone_number.replace('+', '');
+      const whatsappMessage = `
+      أهلاً ${adminData.name} 👋،
+
+      تم تجديد اشتراكك بنجاح 🎉
+
+      نوع الاشتراك الجديد: ${subscription_type === 'monthly' ? 'شهري' : 'سنوي'}
+      تاريخ الانتهاء الجديد: ${formattedEndDate}
+
+      شكرًا لاستخدام منصتنا 🌟
+      `.trim();
+
+      await sendWhatsAppMessage(formattedPhone, whatsappMessage);
+    }
+
+    res.json({
+      message: '✅ تم تجديد الاشتراك بنجاح وإرسال الإشعار، وتم تحديث اشتراكات الوكلاء المرتبطة.',
+      newEndDate: formattedEndDate
+    });
+
+  } catch (error) {
+    console.error('❌ Error renewing subscription:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء تجديد الاشتراك.' });
+  }
+});
+
+
+
+app.post('/api/subscriptions/:adminId/cancel', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { adminId } = req.params;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه إنهاء الاشتراك.' });
+  }
+
+  const sql = `
+    UPDATE admin_subscriptions
+    SET status = 'expired', end_date = CURDATE()
+    WHERE admin_id = ?
+  `;
+
+  try {
+    await query(sql, [adminId]);
+
+    const [adminData] = await query(`
+      SELECT name, phone_number FROM users WHERE id = ?
+    `, [adminId]);
+
+    if (adminData && adminData.phone_number) {
+      const formattedPhone = adminData.phone_number.replace('+', '');
+      const whatsappMessage = `
+      أهلاً ${adminData.name} 👋،
+
+      تم إنهاء اشتراكك بنجاح.
+
+      شكرًا لاستخدام منصتنا 🌟
+      `.trim();
+
+      await sendWhatsAppMessage(formattedPhone, whatsappMessage);
+    }
+
+    res.json({ message: '✅ تم إنهاء الاشتراك بنجاح وإرسال الإشعار.' });
+  } catch (error) {
+    console.error('❌ Error cancelling subscription:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء إنهاء الاشتراك.' });
+  }
+});
+
+
+app.get('/api/admins/active-with-tenant-count', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه رؤية التفاصيل.' });
+  }
+
+  try {
+    const activeAdmins = await query(`
+      SELECT 
+        u.id AS admin_id,
+        u.name,
+        u.user_id,
+        s.tenant_limit,
+        (SELECT COUNT(*) 
+         FROM rental_contracts rc
+         JOIN users tenants ON tenants.id = rc.tenant_id
+         WHERE tenants.created_by = u.id AND rc.status = 'active') AS active_tenants_count
+      FROM admin_subscriptions s
+      JOIN users u ON s.admin_id = u.id
+      WHERE s.status = 'active' 
+        AND s.end_date >= CURDATE()
+        AND u.user_type = 'admin'
+        AND u.viewer_id IS NULL
+      ORDER BY u.name ASC
+    `);
+
+    res.json({
+      active_admins_count: activeAdmins.length,
+      admins: activeAdmins,
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching admins:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب بيانات المالكين.' });
+  }
+});
+
+
+
+app.post('/api/admins/:adminId/update-tenant-limit', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { adminId } = req.params;
+  const { tenant_limit } = req.body;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  if (typeof tenant_limit !== 'number' || tenant_limit < 0) {
+    return res.status(400).json({ message: '❗ يجب تحديد عدد المستأجرين المسموح بهم بشكل صحيح.' });
+  }
+
+  try {
+    const [userCheck] = await query(`SELECT viewer_id FROM users WHERE id = ? AND user_type = 'admin'`, [adminId]);
+    
+    if (userCheck?.viewer_id !== null) {
+      return res.status(400).json({ message: '❌ هذا المستخدم ليس مالكًا مستقلًا.' });
+    }
+
+    await query(`
+      UPDATE admin_subscriptions SET tenant_limit = ? WHERE admin_id = ?
+    `, [tenant_limit, adminId]);
+
+    const [adminData] = await query(`
+      SELECT name, phone_number FROM users WHERE id = ?
+    `, [adminId]);
+
+    if (adminData && adminData.phone_number) {
+      const formattedPhone = adminData.phone_number.replace('+', '');
+      const whatsappMessage = `
+      أهلاً ${adminData.name} 👋،
+
+      تم تحديث عدد المستأجرين المسموح لك بإضافتهم 🎉
+      العدد الجديد المسموح به: ${tenant_limit}
+
+      شكرًا لاستخدام منصتنا 🌟
+      `.trim();
+
+      await sendWhatsAppMessage(formattedPhone, whatsappMessage);
+    }
+
+    res.json({
+      message: '✅ تم تحديث عدد المستأجرين للمالك المستقل بنجاح.',
+      adminId,
+      tenant_limit
+    });
+
+  } catch (error) {
+    console.error('❌ Error updating tenant limit:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء تحديث عدد المستأجرين.' });
+  }
+});
+
+
+
+app.get('/api/super/finance-6months', verifyToken, async (req, res) => {
+  const { userType, id: superId } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ فقط السوبر يمكنه الوصول لهذه البيانات.' });
+  }
+
+ const sql = `
+    SELECT
+      IFNULL(SUM(rcd.periodic_rent_payment * 
+        LEAST(
+          TIMESTAMPDIFF(MONTH, GREATEST(CURDATE(), rcd.contract_start), LEAST(DATE_ADD(CURDATE(), INTERVAL 6 MONTH), rcd.contract_end))
+          , 6
+        )), 0) AS total_expected_income,
+      COUNT(DISTINCT rcd.id) AS contracts_count
+    FROM rental_contracts_details rcd
+    WHERE rcd.admin_id = ?
+      AND rcd.contract_end >= CURDATE()
+      AND rcd.contract_start <= DATE_ADD(CURDATE(), INTERVAL 6 MONTH);
+  `;
+
+  try {
+    const rows = await query(sql, [superId]);
+    res.json({ six_months: rows });
+  } catch (err) {
+    console.error('❌ Super-finance-6months Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
+
+
+app.get('/api/super/subscription-income', verifyToken, async (req, res) => {
+const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  try {
+    const [prices] = await query(`
+      SELECT monthly_price, yearly_price FROM subscription_prices WHERE price_type = 'regular_admin' LIMIT 1
+    `);
+
+    if (!prices) {
+      return res.status(400).json({ message: '❗️ لم يتم إدخال أسعار اشتراكات المالكين المستقلين بعد.' });
+    }
+
+    const subscriptions = await query(`
+      SELECT s.subscription_type, s.start_date, s.end_date
+      FROM admin_subscriptions s
+      JOIN users u ON s.admin_id = u.id
+      WHERE s.status = 'active' 
+        AND s.end_date >= CURDATE()
+        AND u.user_type = 'admin'
+        AND u.viewer_id IS NULL
+    `);
+
+    let monthlyIncome = 0;
+    let yearlyIncome = 0;
+
+    subscriptions.forEach(sub => {
+      const remainingDays = Math.ceil((new Date(sub.end_date) - new Date()) / (1000 * 60 * 60 * 24));
+      if (sub.subscription_type === 'monthly') {
+        monthlyIncome += (prices.monthly_price / 30) * Math.min(remainingDays, 30);
+      } else if (sub.subscription_type === 'yearly') {
+        yearlyIncome += (prices.yearly_price / 365) * Math.min(remainingDays, 365);
+      }
+    });
+
+    res.json({
+      monthly_income: monthlyIncome.toFixed(2),
+      yearly_income: yearlyIncome.toFixed(2),
+      total_income: (monthlyIncome + yearlyIncome).toFixed(2),
+      current_prices: prices
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'DB Error', error });
+  }
+});
+
+
+
+// لحفظ أسعار اشتراكات المالكين المستقلين (admins بدون viewer)
+app.post('/api/super/admins/subscription-prices', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const { monthly_price, yearly_price } = req.body;
+
+  if (monthly_price === undefined || yearly_price === undefined) {
+    return res.status(400).json({ message: '❗️ يجب إدخال monthly_price و yearly_price.' });
+  }
+
+  try {
+    // حفظ أو تحديث أسعار المالكين المستقلين (regular_admin)
+    await query(`
+      INSERT INTO subscription_prices (id, monthly_price, yearly_price, price_type) VALUES (1, ?, ?, 'regular_admin')
+      ON DUPLICATE KEY UPDATE monthly_price = ?, yearly_price = ?
+    `, [monthly_price, yearly_price, monthly_price, yearly_price]);
+
+    res.json({ message: '✅ تم حفظ أسعار اشتراكات المالكين المستقلين بنجاح.' });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'حدث خطأ أثناء حفظ أسعار الاشتراكات.' });
+  }
+});
+
+
+
+
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
 app.post('/api/create-tenant', verifyToken, async (req, res) => {
@@ -1472,35 +2018,1142 @@ app.get('/api/super/expired-contracts', verifyToken, async (req, res) => {
 });
 
 
+app.post('/api/super/notify-all-admins', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { title, body } = req.body;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه إرسال الإشعارات.' });
+  }
+
+  if (!title || !body) {
+    return res.status(400).json({ message: '❗️ العنوان والمحتوى مطلوبان.' });
+  }
+
+  try {
+    const admins = await query(`
+      SELECT fcm_token FROM users WHERE user_type = 'admin' AND fcm_token IS NOT NULL
+    `);
+
+    const tokens = admins.map(admin => admin.fcm_token).filter(Boolean);
+
+    if (tokens.length === 0) {
+      return res.status(404).json({ message: 'لا يوجد ملاك لديهم FCM tokens.' });
+    }
+
+    const accessToken = await getAccessToken();
+
+    // إرسال الإشعارات بشكل متزامن (بالتوازي)
+    await Promise.all(tokens.map(token => {
+      const notificationPayload = {
+        message: {
+          token,
+          notification: { title, body },
+          data: { screen: 'super-notifications' }
+        }
+      };
+
+      return fetch(
+        `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(notificationPayload),
+        }
+      );
+    }));
+
+    res.json({ message: '✅ تم إرسال الإشعار لجميع الملاك بنجاح.' });
+
+  } catch (err) {
+    console.error('❌ Notify all admins error:', err);
+    res.status(500).json({ message: 'خطأ في إرسال الإشعارات', error: err });
+  }
+});
 
 
+app.post('/api/super/notify-admin/:adminId', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { adminId } = req.params;
+  const { title, body } = req.body;
 
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه إرسال الإشعارات.' });
+  }
+
+  if (!title || !body) {
+    return res.status(400).json({ message: '❗️ العنوان والمحتوى مطلوبان.' });
+  }
+
+  try {
+    const [admin] = await query(`
+      SELECT fcm_token FROM users WHERE id = ? AND user_type = 'admin'
+    `, [adminId]);
+
+    if (!admin || !admin.fcm_token) {
+      return res.status(404).json({ message: 'هذا المالك ليس لديه FCM token.' });
+    }
+
+    const notificationPayload = {
+      message: {
+        notification: { title, body },
+        token: admin.fcm_token,
+        data: { screen: 'super-notifications' }
+      }
+    };
+
+    const accessToken = await getAccessToken();
+
+    await fetch(
+      `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(notificationPayload),
+      }
+    );
+
+    res.json({ message: `✅ تم إرسال الإشعار إلى المالك بنجاح.` });
+
+  } catch (err) {
+    console.error('❌ Notify admin error:', err);
+    res.status(500).json({ message: 'خطأ في إرسال الإشعار', error: err });
+  }
+});
+
+
+app.post('/api/super/notify-admins', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { title, body, adminIds } = req.body;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  if (!title || !body || !adminIds || !adminIds.length) {
+    return res.status(400).json({ message: 'بيانات غير مكتملة.' });
+  }
+
+  try {
+    // ✅ هنا التصحيح الرئيسي
+    const placeholders = adminIds.map(() => '?').join(',');
+    const tokensResult = await query(
+      `SELECT fcm_token FROM users WHERE id IN (${placeholders}) AND fcm_token IS NOT NULL`,
+      adminIds
+    );
+
+    const tokens = tokensResult.map(admin => admin.fcm_token).filter(Boolean);
+    const accessToken = await getAccessToken();
+
+    await Promise.all(tokens.map(token => fetch(
+      `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: {
+            token,
+            notification: { title, body },
+            data: { screen: 'super-notifications' }
+          }
+        })
+      }
+    )));
+
+    res.json({ message: '✅ تم الإرسال للمجموعة بنجاح.' });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'خطأ أثناء الإرسال.' });
+  }
+});
 
 
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////Viewer user type APIs//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-const axios = require('axios');
 
-const instance_id = 'instance124299';
-const token = 'hk7g25xetv3t58r5';
 
-async function sendWhatsAppMessage(to, message) {
-  try {
-    const response = await axios.post(`https://api.ultramsg.com/${instance_id}/messages/chat`, {
-      token: token,
-      to: to,
-      body: message
-    });
+app.post('/api/super/create-viewer-with-agents', verifyToken, async (req, res) => {
+  const { userType, id: created_by } = req.user;
 
-    console.log('✅ WhatsApp sent:', response.data);
-    return response.data;
-  } catch (error) {
-    console.error('❌ WhatsApp sending error:', error);
-    throw error;
+
+  
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+
+
+  const { viewer, agents } = req.body;
+
+if (!viewer || !Array.isArray(agents) || agents.length === 0) {
+  return res.status(400).json({ message: '❌ بيانات غير مكتملة.' });
+}
+
+// التحقق من عدد أرقام user_id للفيور
+if (!/^\d{10}$/.test(viewer.user_id)) {
+  return res.status(400).json({ message: '❗ رقم هوية الـ Viewer يجب أن يكون 10 أرقام.' });
+}
+
+// تحقق من عدم وجود user_id مكرر (في النظام)
+const [existingViewer] = await query(`SELECT 1 FROM users WHERE user_id = ?`, [viewer.user_id]);
+if (existingViewer) {
+  return res.status(400).json({ message: `❌ رقم هوية المتطلع (${viewer.user_id}) مستخدم مسبقًا.` });
+}
+
+// التحقق من جميع الوكلاء
+for (const agent of agents) {
+  if (!/^\d{10}$/.test(agent.user_id)) {
+    return res.status(400).json({ message: `❗ رقم هوية الوكيل (${agent.user_id}) يجب أن يكون 10 أرقام.` });
+  }
+
+  const [existingAgent] = await query(`SELECT 1 FROM users WHERE user_id = ?`, [agent.user_id]);
+  if (existingAgent) {
+    return res.status(400).json({ message: `❌ رقم هوية الوكيل (${agent.user_id}) مستخدم مسبقًا.` });
   }
 }
+
+
+
+  if (!viewer || !Array.isArray(agents) || agents.length === 0) {
+    return res.status(400).json({ message: 'بيانات غير مكتملة: يجب توفير بيانات الـViewer والوكلاء.' });
+  }
+
+  const viewerToken = Math.floor(10000000 + Math.random() * 90000000).toString();
+
+  try {
+    // إنشاء حساب Viewer
+    const viewerResult = await query(`
+      INSERT INTO users (user_id, name, phone_number, user_type, token, created_by, max_agents, tenant_limit_per_agent)
+      VALUES (?, ?, ?, 'viewer', ?, ?, ?, ?)
+    `, [
+      viewer.user_id,
+      viewer.name,
+      viewer.phone_number,
+      viewerToken,
+      created_by,
+      viewer.max_agents,
+      viewer.tenant_limit_per_agent
+    ]);
+
+    const viewerId = viewerResult.insertId;
+
+    // إنشاء اشتراك Viewer
+    const startDate = new Date();
+    let endDate = new Date();
+    if (viewer.subscription_type === 'monthly') {
+      endDate.setMonth(endDate.getMonth() + 1);
+    } else {
+      endDate.setFullYear(endDate.getFullYear() + 1);
+    }
+
+    const viewerSubscriptionResult = await query(`
+      INSERT INTO admin_subscriptions (admin_id, start_date, end_date, status, subscription_type, tenant_limit)
+      VALUES (?, ?, ?, 'active', ?, ?)
+    `, [
+      viewerId,
+      startDate,
+      endDate,
+      viewer.subscription_type,
+      viewer.tenant_limit_per_agent
+    ]);
+
+    const viewerSubscriptionId = viewerSubscriptionResult.insertId;
+
+    // إنشاء الوكلاء واشتراكاتهم
+    const createdAgents = [];
+
+    for (const agent of agents) {
+      const agentToken = Math.floor(10000000 + Math.random() * 90000000).toString();
+
+      const agentResult = await query(`
+        INSERT INTO users (user_id, name, phone_number, user_type, token, created_by, viewer_id)
+        VALUES (?, ?, ?, 'admin', ?, ?, ?)
+      `, [
+        agent.user_id,
+        agent.name,
+        agent.phone_number,
+        agentToken,
+        created_by,
+        viewerId
+      ]);
+
+      const agentId = agentResult.insertId;
+
+      await query(`
+        INSERT INTO admin_subscriptions (admin_id, start_date, end_date, status, subscription_type, tenant_limit, linked_subscription_id)
+        VALUES (?, ?, ?, 'active', ?, ?, ?)
+      `, [
+        agentId,
+        startDate,
+        endDate,
+        viewer.subscription_type,
+        viewer.tenant_limit_per_agent,
+        viewerSubscriptionId
+      ]);
+
+      createdAgents.push({
+        user_id: agent.user_id,
+        name: agent.name,
+        token: agentToken
+      });
+    }
+
+    res.json({
+      message: '✅ تم إنشاء المتطلع وجميع الوكلاء واشتراكاتهم بنجاح.',
+      viewer: {
+        user_id: viewer.user_id,
+        name: viewer.name,
+        token: viewerToken
+      },
+      agents: createdAgents
+    });
+
+  } catch (error) {
+    console.error('❌ Error creating viewer and agents:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء إنشاء الحسابات.' });
+  }
+});
+
+
+
+///////////🔹 اشتراكات الـViewers والوكلاء المرتبطين بهم (Active Viewer & Agents Subscriptions):
+
+app.get('/api/viewers-agents/viewers-subscriptions', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT 
+      u.id AS viewer_id,
+      u.name,
+      u.user_id,
+      u.phone_number,
+      s.start_date,
+      s.end_date,
+      s.subscription_type,
+      s.status,
+      u.created_at,
+      COUNT(agents.id) AS agents_count
+    FROM users u
+    JOIN admin_subscriptions s ON s.admin_id = u.id
+    LEFT JOIN users agents ON agents.viewer_id = u.id
+    WHERE u.user_type = 'viewer' 
+      AND s.status = 'active'
+      AND s.end_date >= CURDATE()
+    GROUP BY u.id, s.id
+    ORDER BY s.end_date ASC
+  `;
+
+  try {
+    const viewers = await query(sql);
+    res.json({
+      total_count: viewers.length,
+      viewers
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب اشتراكات المتطلعين.' });
+  }
+});
+
+
+app.get('/api/viewers/:viewerId/agents', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const { viewerId } = req.params;
+
+  const sql = `
+    SELECT 
+      u.id AS agent_id,
+      u.name,
+      u.user_id,
+      u.phone_number,
+      s.start_date,
+      s.end_date,
+      s.subscription_type,
+      s.status,
+      s.tenant_limit, -- ✅ أضفنا عدد المستأجرين المسموح به
+      (
+        SELECT COUNT(*) 
+        FROM rental_contracts rc
+        JOIN users tenants ON tenants.id = rc.tenant_id
+        WHERE tenants.created_by = u.id AND rc.status = 'active'
+      ) AS active_tenants_count
+    FROM users u
+    JOIN admin_subscriptions s ON u.id = s.admin_id
+    WHERE u.viewer_id = ? AND u.user_type = 'admin'
+  `;
+
+  try {
+    const agents = await query(sql, [viewerId]);
+    res.json({
+      total_agents: agents.length,
+      agents,
+    });
+  } catch (err) {
+    console.error('❌ Error fetching agents:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب بيانات الوكلاء.' });
+  }
+});
+
+
+
+
+/////////////////🔹 الاشتراكات المنتهية للـViewers والوكلاء المرتبطين بهم (Expired Viewer & Agents Subscriptions):
+app.get('/api/viewers-agents/expired-subscriptions', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT 
+      u.id AS viewer_id,
+      u.user_id,
+      u.name,
+      u.phone_number,
+      s.start_date,
+      s.end_date,
+      s.subscription_type,
+      s.status
+    FROM admin_subscriptions s
+    JOIN users u ON s.admin_id = u.id
+    WHERE 
+      u.user_type = 'viewer' AND
+      (s.status = 'expired' OR s.status = 'cancelled' OR s.end_date < CURDATE())
+    ORDER BY s.end_date DESC
+  `;
+
+  try {
+    const subscriptions = await query(sql);
+    res.json({
+      total_count: subscriptions.length,
+      viewers: subscriptions
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب اشتراكات الفيور المنتهية.' });
+  }
+});
+
+
+
+
+
+/////////////////🔹 الدخل المتوقع من اشتراكات الـViewers والوكلاء المرتبطين بهم (Viewer & Agents Subscription Income):
+app.get('/api/viewers-agents/subscription-income', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  try {
+    // 1. جلب الاشتراكات الفعالة للـ Viewers مع عدد وكلائهم
+    const subscriptions = await query(`
+      SELECT 
+        s.subscription_type,
+        u.id AS viewer_id,
+        (
+          SELECT COUNT(*) 
+          FROM users a 
+          WHERE a.viewer_id = u.id AND a.user_type = 'admin'
+        ) AS agents_count
+      FROM admin_subscriptions s
+      JOIN users u ON s.admin_id = u.id
+      WHERE u.user_type = 'viewer' 
+        AND s.status = 'active' 
+        AND s.end_date >= CURDATE()
+    `);
+
+    // 2. جلب شرائح التسعير من جدول tiers
+    const tiers = await query(`SELECT * FROM viewer_subscription_tiers`);
+
+    let monthlyIncome = 0;
+    let yearlyIncome = 0;
+    let viewerMonthlyCount = 0;
+    let viewerYearlyCount = 0;
+
+    // 3. حساب كل اشتراك حسب عدد الوكلاء وتحديد الشريحة المناسبة
+    subscriptions.forEach(sub => {
+      const agents = sub.agents_count;
+
+      const tier = tiers.find(t => 
+        agents >= t.min_agents && agents <= t.max_agents
+      );
+
+      if (!tier) return;
+
+      if (sub.subscription_type === 'monthly') {
+        monthlyIncome += parseFloat(tier.monthly_price);
+        viewerMonthlyCount++;
+      } else if (sub.subscription_type === 'yearly') {
+        yearlyIncome += parseFloat(tier.yearly_price);
+        viewerYearlyCount++;
+      }
+    });
+
+    // 4. إرسال النتائج
+    res.json({
+      viewer_monthly_count: viewerMonthlyCount,
+      viewer_yearly_count: viewerYearlyCount,
+      monthly_income: monthlyIncome.toFixed(2),
+      yearly_income: yearlyIncome.toFixed(2),
+      total_income: (monthlyIncome + yearlyIncome).toFixed(2),
+      tiers_used: tiers,
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'DB Error', error });
+  }
+});
+
+
+// ✅ API لتحديث شريحة تسعير معينة أو إضافتها إذا لم تكن موجودة
+app.post('/api/super/update-viewer-tier', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { tier_id, min_agents, max_agents, monthly_price, yearly_price } = req.body;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  if (
+    typeof min_agents !== 'number' ||
+    typeof max_agents !== 'number' ||
+    typeof monthly_price !== 'number' ||
+    typeof yearly_price !== 'number' ||
+    min_agents < 1 ||
+    max_agents < min_agents
+  ) {
+    return res.status(400).json({ message: '⚠️ بيانات غير صحيحة للشريحة.' });
+  }
+
+  try {
+    if (tier_id) {
+      // تعديل شريحة موجودة
+      await query(`
+        UPDATE viewer_subscription_tiers
+        SET min_agents = ?, max_agents = ?, monthly_price = ?, yearly_price = ?
+        WHERE id = ?
+      `, [min_agents, max_agents, monthly_price, yearly_price, tier_id]);
+    } else {
+      // إضافة شريحة جديدة
+      await query(`
+        INSERT INTO viewer_subscription_tiers (min_agents, max_agents, monthly_price, yearly_price)
+        VALUES (?, ?, ?, ?)
+      `, [min_agents, max_agents, monthly_price, yearly_price]);
+    }
+
+    res.json({
+      message: '✅ تم حفظ/تحديث الشريحة بنجاح.'
+    });
+
+  } catch (error) {
+    console.error('❌ Tier Update Error:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء تحديث البيانات.', error });
+  }
+});
+
+
+app.get('/api/viewer-subscription-tiers', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه الوصول.' });
+  }
+
+  try {
+    const tiers = await query(`
+      SELECT id, min_agents, max_agents, monthly_price, yearly_price 
+      FROM viewer_subscription_tiers 
+      ORDER BY min_agents ASC
+    `);
+
+    res.json({
+      total: tiers.length,
+      tiers,
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching tiers:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب شرائح التسعير.' });
+  }
+});
+
+
+
+
+
+
+//////////////////////////🔹 إحصائيات الـViewers مع عدد وكلائهم وعدد المستأجرين لكل وكيل (Viewers & Agents Stats):
+
+app.get('/api/viewers-agents/stats', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  try {
+    const viewers = await query(`
+      SELECT 
+        u.id AS viewer_id,
+        u.name AS viewer_name,
+        u.user_id AS viewer_user_id,
+        COUNT(DISTINCT agents.id) AS agents_count,
+        IFNULL(SUM(agent_sub.tenant_limit), 0) AS total_tenant_limit,
+        IFNULL(SUM(active_tenants_count.active_count), 0) AS active_tenants_count
+      FROM users u
+      LEFT JOIN users agents ON agents.viewer_id = u.id
+      LEFT JOIN admin_subscriptions agent_sub ON agent_sub.admin_id = agents.id
+      LEFT JOIN (
+        SELECT tenants.created_by AS agent_id, COUNT(*) AS active_count
+        FROM rental_contracts rc
+        JOIN users tenants ON tenants.id = rc.tenant_id
+        WHERE rc.status = 'active'
+        GROUP BY tenants.created_by
+      ) AS active_tenants_count ON active_tenants_count.agent_id = agents.id
+      WHERE u.user_type = 'viewer'
+      GROUP BY u.id, u.name, u.user_id
+      ORDER BY u.name ASC
+    `);
+
+    res.json({
+      viewers_count: viewers.length,
+      viewers
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'DB Error', error });
+  }
+});
+
+
+
+/////////////////////////🔹 إنشاء API جديد خاص فقط بأسعار اشتراكات الـViewers الذين لديهم وكلاء:
+
+// لحفظ أسعار اشتراكات الـViewers مع وكلائهم
+app.post('/api/super/viewers/subscription-prices', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const { monthly_price, yearly_price } = req.body;
+
+  if (monthly_price === undefined || yearly_price === undefined) {
+    return res.status(400).json({ message: '❗️ يجب إدخال monthly_price و yearly_price.' });
+  }
+
+  try {
+    // حفظ أو تحديث أسعار الـ viewers
+    await query(`
+      INSERT INTO subscription_prices (id, monthly_price, yearly_price, price_type) VALUES (2, ?, ?, 'viewer')
+      ON DUPLICATE KEY UPDATE monthly_price = ?, yearly_price = ?
+    `, [monthly_price, yearly_price, monthly_price, yearly_price]);
+
+    res.json({ message: '✅ تم حفظ أسعار اشتراكات الـViewers بنجاح.' });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'حدث خطأ أثناء حفظ أسعار اشتراكات الـViewers.' });
+  }
+});
+
+//////////////////الهدف منه تحديث عدد المستأجرين المسموح بهم لكل وكيل مرتبط بالـ Viewer.
+
+app.post('/api/viewers/:viewerId/update-agent-tenant-limit', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { viewerId } = req.params;
+  const { tenant_limit } = req.body;
+
+  console.log('🟡 طلب تحديث tenant_limit:', { viewerId, tenant_limit });
+
+  if (userType !== 'super') {
+    console.log('🔴 رفض: المستخدم ليس super');
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  if (typeof tenant_limit !== 'number' || tenant_limit < 0) {
+    console.log('🔴 tenant_limit غير صالح:', tenant_limit);
+    return res.status(400).json({ message: '❗ يجب تحديد عدد المستأجرين المسموح بهم بشكل صحيح.' });
+  }
+
+  try {
+    const [viewerCheck] = await query(`
+      SELECT id, name FROM users 
+      WHERE id = ? AND user_type = 'viewer'
+    `, [viewerId]);
+
+    if (!viewerCheck) {
+      console.log('🔴 لم يتم العثور على viewer:', viewerId);
+      return res.status(404).json({ message: '❌ لم يتم العثور على الـ Viewer.' });
+    }
+
+    console.log('✅ تم العثور على الـ Viewer:', viewerCheck);
+
+    // تأكيد عدد الوكلاء المرتبطين
+    const agents = await query(`
+      SELECT id, name FROM users
+      WHERE viewer_id = ?
+    `, [viewerId]);
+
+    console.log(`📦 عدد الوكلاء المرتبطين بالـ Viewer ${viewerId}:`, agents.length);
+
+    if (agents.length === 0) {
+      console.log('⚠️ لا يوجد وكلاء مرتبطين بهذا الـ Viewer');
+    } else {
+      console.log('👥 الوكلاء:', agents.map(a => ({ id: a.id, name: a.name })));
+    }
+
+    // التحديث الفعلي
+    const result = await query(`
+      UPDATE admin_subscriptions
+      SET tenant_limit = ?
+      WHERE admin_id IN (SELECT id FROM users WHERE viewer_id = ?)
+    `, [tenant_limit, viewerId]);
+
+    console.log('✅ نتيجة التحديث:', result);
+
+    const [viewerData] = await query(`
+      SELECT phone_number FROM users WHERE id = ?
+    `, [viewerId]);
+
+    if (viewerData && viewerData.phone_number) {
+      const formattedPhone = viewerData.phone_number.replace('+', '');
+      const whatsappMessage = `
+      أهلاً ${viewerCheck.name} 👋،
+
+      تم تحديث عدد المستأجرين المسموح لوكلائك بإضافتهم 🎉
+      العدد الجديد لكل وكيل: ${tenant_limit}
+
+      شكرًا لاستخدام منصتنا 🌟
+      `.trim();
+
+      console.log('📤 إرسال رسالة واتساب إلى:', formattedPhone);
+      await sendWhatsAppMessage(formattedPhone, whatsappMessage);
+    }
+
+    res.json({
+      message: '✅ تم تحديث عدد المستأجرين لجميع الوكلاء بنجاح وإرسال الإشعار.',
+      viewerId,
+      tenant_limit
+    });
+
+  } catch (error) {
+    console.error('❌ Error updating agents tenant limit:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء تحديث عدد المستأجرين لوكلاء الـViewer.' });
+  }
+});
+
+
+
+app.post('/api/viewers-agents/subscriptions/:userId/renew', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { userId } = req.params;
+  const { subscription_type } = req.body;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  try {
+    const [currentSub] = await query(`
+      SELECT end_date FROM admin_subscriptions
+      WHERE admin_id = ?
+    `, [userId]);
+
+    const today = new Date();
+    let baseDate;
+
+    if (currentSub?.end_date) {
+      const end = new Date(currentSub.end_date);
+      baseDate = end > today ? end : today;
+    } else {
+      baseDate = today;
+    }
+
+    const newEndDate = new Date(baseDate);
+    if (subscription_type === 'monthly') {
+      newEndDate.setMonth(newEndDate.getMonth() + 1);
+    } else if (subscription_type === 'yearly') {
+      newEndDate.setFullYear(newEndDate.getFullYear() + 1);
+    } else {
+      return res.status(400).json({ message: '❗ نوع الاشتراك غير صالح (monthly أو yearly).' });
+    }
+
+    const formattedStartDate = today.toISOString().slice(0, 10); // نسجل التمديد من اليوم، حتى لو بدينا من end_date
+    const formattedEndDate = newEndDate.toISOString().slice(0, 10);
+
+    // تحديث اشتراك الفيور
+    await query(`
+      UPDATE admin_subscriptions
+      SET start_date = ?, end_date = ?, subscription_type = ?, status = 'active'
+      WHERE admin_id = ?
+    `, [formattedStartDate, formattedEndDate, subscription_type, userId]);
+
+    // تحديث الوكلاء المرتبطين بنفس الاشتراك
+    await query(`
+      UPDATE admin_subscriptions s
+      JOIN users u ON s.admin_id = u.id
+      SET s.start_date = ?, s.end_date = ?, s.subscription_type = ?, s.status = 'active'
+      WHERE u.viewer_id = ? AND s.linked_subscription_id IS NOT NULL
+    `, [formattedStartDate, formattedEndDate, subscription_type, userId]);
+
+    res.json({
+      message: '✅ تم تجديد الاشتراك بنجاح.',
+      userId,
+      subscription_type,
+      newEndDate: formattedEndDate
+    });
+
+  } catch (error) {
+    console.error('❌ Error renewing subscription:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء تجديد الاشتراك.' });
+  }
+});
+
+
+
+app.post('/api/viewers/:viewerId/cancel-subscription', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { viewerId } = req.params;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  try {
+    // إلغاء اشتراك الـ Viewer
+    await query(`
+      UPDATE admin_subscriptions
+      SET status = 'cancelled', end_date = CURDATE()
+      WHERE admin_id = ?
+    `, [viewerId]);
+
+    // إلغاء اشتراكات جميع الوكلاء المرتبطين بهذا الـ Viewer
+    await query(`
+      UPDATE admin_subscriptions
+      SET status = 'cancelled', end_date = CURDATE()
+      WHERE admin_id IN (SELECT id FROM users WHERE viewer_id = ?)
+    `, [viewerId]);
+
+    res.json({
+      message: '✅ تم إلغاء اشتراك المتطلع وجميع الوكلاء المرتبطين به بنجاح.',
+      viewerId,
+    });
+
+  } catch (error) {
+    console.error('❌ Error cancelling subscriptions:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء إلغاء الاشتراك.' });
+  }
+});
+
+
+// 1. إظهار كل الخدمات
+app.get('/api/dynamic-services', verifyToken, async (req, res) => {
+  if (req.user.userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه الوصول.' });
+  }
+
+  try {
+    const services = await query('SELECT * FROM dynamic_services ORDER BY display_order');
+    res.json({ services });
+  } catch (error) {
+    console.error('❌ خطأ في جلب الخدمات:', error);
+    res.status(500).json({ message: 'خطأ في السيرفر', error });
+  }
+});
+
+// 2. تعديل خدمة معينة
+app.put('/api/dynamic-services/:id', verifyToken, async (req, res) => {
+  if (req.user.userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه التعديل.' });
+  }
+
+  const { id } = req.params;
+  const { title, icon, description, route, display_order, is_default } = req.body;
+
+  try {
+    await query(`
+      UPDATE dynamic_services
+      SET title = ?, icon = ?, description = ?, route = ?, display_order = ?, is_default = ?
+      WHERE id = ?
+    `, [title, icon, description, route, display_order, is_default, id]);
+
+    res.json({ message: '✅ تم تعديل الخدمة بنجاح' });
+  } catch (error) {
+    console.error('❌ خطأ في تعديل الخدمة:', error);
+    res.status(500).json({ message: 'خطأ في السيرفر', error });
+  }
+});
+
+// 3. تفعيل أو تعطيل خدمة
+app.patch('/api/dynamic-services/:id/status', verifyToken, async (req, res) => {
+  if (req.user.userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه التعديل.' });
+  }
+
+  const { id } = req.params;
+  const { is_active } = req.body;
+
+  try {
+    await query(`
+      UPDATE dynamic_services
+      SET is_active = ?
+      WHERE id = ?
+    `, [is_active ? 1 : 0, id]);
+
+    res.json({ message: `✅ تم ${is_active ? 'تفعيل' : 'تعطيل'} الخدمة بنجاح` });
+  } catch (error) {
+    console.error('❌ خطأ في تحديث حالة الخدمة:', error);
+    res.status(500).json({ message: 'خطأ في السيرفر', error });
+  }
+});
+
+
+app.get('/api/super/viewers-with-agent-count', verifyToken, async (req, res) => {
+  if (req.user.userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه الوصول.' });
+  }
+
+  try {
+    const viewers = await query(`
+      SELECT 
+        v.id AS viewer_id,
+        v.name AS viewer_name,
+        v.user_id AS viewer_user_id,
+        v.phone_number,
+        COUNT(a.id) AS agents_count
+      FROM users v
+      LEFT JOIN users a ON a.viewer_id = v.id AND a.user_type = 'admin'
+      WHERE v.user_type = 'viewer'
+      GROUP BY v.id, v.name, v.user_id, v.phone_number
+      ORDER BY v.name ASC
+    `);
+
+    res.json({
+      total_viewers: viewers.length,
+      viewers
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching viewers with agent count:', error);
+    res.status(500).json({ message: 'خطأ داخلي في الخادم', error });
+  }
+});
+
+
+app.get('/api/super/viewers-agents-count', verifyToken, async (req, res) => {
+  if (req.user.userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه الوصول.' });
+  }
+
+  try {
+    const [viewerCountResult] = await query(`
+      SELECT COUNT(*) AS total_viewers FROM users WHERE user_type = 'viewer'
+    `);
+
+    const [agentsCountResult] = await query(`
+      SELECT COUNT(*) AS total_agents FROM users WHERE user_type = 'admin' AND viewer_id IS NOT NULL
+    `);
+
+    res.json({
+      total_viewers: viewerCountResult.total_viewers,
+      total_agents: agentsCountResult.total_agents
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching total viewers and agents:', error);
+    res.status(500).json({ message: 'خطأ داخلي في الخادم', error });
+  }
+});
+
+
+app.get('/api/super/agents', verifyToken, async (req, res) => {
+  if (req.user.userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه الوصول.' });
+  }
+
+  try {
+    const agents = await query(`
+      SELECT
+        a.id AS agent_id,
+        a.user_id AS agent_user_id,
+        a.name AS agent_name,
+        a.phone_number,
+        a.viewer_id,
+        v.name AS viewer_name
+      FROM users a
+      LEFT JOIN users v ON a.viewer_id = v.id
+      WHERE a.user_type = 'admin' AND a.viewer_id IS NOT NULL
+      ORDER BY a.name ASC
+    `);
+
+    res.json({
+      total_agents: agents.length,
+      agents
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching agents data:', error);
+    res.status(500).json({ message: 'خطأ داخلي في الخادم', error });
+  }
+});
+
+app.put('/api/super/agents/:agentId/update-agent-details', verifyToken, async (req, res) => {
+  const { agentId } = req.params;
+  const { user_id, name, phone_number } = req.body;
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  // تحقق من صحة البيانات
+  if (!/^\d{10}$/.test(user_id)) {
+    return res.status(400).json({ message: '❗ رقم الهوية يجب أن يكون 10 أرقام.' });
+  }
+
+  try {
+    // تأكد من أن رقم الهوية الجديد غير مستخدم
+    const [existingUser] = await query(`SELECT id FROM users WHERE user_id = ? AND id != ?`, [user_id, agentId]);
+    if (existingUser) {
+      return res.status(400).json({ message: `❌ رقم الهوية (${user_id}) مستخدم مسبقاً.` });
+    }
+
+    const newToken = Math.floor(10000000 + Math.random() * 90000000).toString();
+
+    // تحديث بيانات الوكيل
+    await query(`
+      UPDATE users SET
+        user_id = ?,
+        name = ?,
+        phone_number = ?,
+        token = ?
+      WHERE id = ? AND user_type = 'admin'
+    `, [user_id, name, phone_number, newToken, agentId]);
+
+    res.json({
+      message: '✅ تم تعديل بيانات الوكيل بنجاح مع توليد توكن جديد.',
+      agentId,
+      newToken
+    });
+
+  } catch (error) {
+    console.error('❌ Error updating agent details:', error);
+    res.status(500).json({ message: 'حدث خطأ داخلي في الخادم.' });
+  }
+});
+
+
+app.post('/api/super/viewers/:viewerId/add-agent', verifyToken, async (req, res) => {
+  const { viewerId } = req.params;
+  const { user_id, name, phone_number } = req.body;
+  const { userType, id: created_by } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  if (!/^\d{10}$/.test(user_id)) {
+    return res.status(400).json({ message: '❗ رقم هوية الوكيل يجب أن يكون 10 أرقام.' });
+  }
+
+  try {
+    // تحقق من وجود رقم الهوية للوكيل
+    const [existingAgent] = await query('SELECT 1 FROM users WHERE user_id = ?', [user_id]);
+    if (existingAgent) {
+      return res.status(400).json({ message: `❌ رقم هوية الوكيل (${user_id}) مستخدم مسبقًا.` });
+    }
+
+    // تحقق من وجود اشتراك فعال للمتطلع
+    const [viewerSubscription] = await query(`
+      SELECT * FROM admin_subscriptions
+      WHERE admin_id = ? AND status = 'active'
+      ORDER BY end_date DESC LIMIT 1
+    `, [viewerId]);
+
+    if (!viewerSubscription) {
+      return res.status(400).json({ message: '❌ لا يوجد اشتراك فعال للمتطلع.' });
+    }
+
+    const agentToken = Math.floor(10000000 + Math.random() * 90000000).toString();
+
+    // إضافة الوكيل
+    const agentResult = await query(`
+      INSERT INTO users (user_id, name, phone_number, user_type, token, created_by, viewer_id)
+      VALUES (?, ?, ?, 'admin', ?, ?, ?)
+    `, [
+      user_id,
+      name,
+      phone_number,
+      agentToken,
+      created_by,
+      viewerId
+    ]);
+
+    const agentId = agentResult.insertId;
+
+    // إنشاء اشتراك الوكيل بنفس تواريخ اشتراك المتطلع
+    await query(`
+      INSERT INTO admin_subscriptions (admin_id, start_date, end_date, status, subscription_type, tenant_limit, linked_subscription_id)
+      VALUES (?, ?, ?, 'active', ?, ?, ?)
+    `, [
+      agentId,
+      viewerSubscription.start_date,
+      viewerSubscription.end_date,
+      viewerSubscription.subscription_type,
+      viewerSubscription.tenant_limit,
+      viewerSubscription.id
+    ]);
+
+    res.json({
+      message: '✅ تم إضافة الوكيل وربطه باشتراك المتطلع بنجاح.',
+      agent: {
+        user_id,
+        name,
+        token: agentToken,
+        start_date: viewerSubscription.start_date,
+        end_date: viewerSubscription.end_date
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error adding agent:', error);
+    res.status(500).json({ message: 'حدث خطأ داخلي أثناء إضافة الوكيل.' });
+  }
+});
+
+
+
+
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1530,6 +3183,38 @@ app.post('/api/analyze-local-pdf', upload.single('pdf'), async (req, res) => {
 
 
   const admin_id = req.user?.id || req.body.adminId; // حسب كيف بتمرر الادمن
+  
+  const [subscription] = await query(`
+  SELECT tenant_limit FROM admin_subscriptions
+  WHERE admin_id = ? AND status = 'active' AND end_date >= CURDATE()
+  LIMIT 1
+`, [admin_id]);
+
+if (!subscription) {
+  return res.status(400).json({ message: '❌ اشتراك المالك غير فعال أو غير موجود.' });
+}
+
+const tenant_limit = subscription.tenant_limit;
+
+// ثانيًا نجيب عدد المستأجرين الحاليين الفعالين
+const [currentTenantCountResult] = await query(`
+  SELECT COUNT(*) AS active_tenants_count
+  FROM rental_contracts rc
+  JOIN users tenants ON tenants.id = rc.tenant_id
+  WHERE tenants.created_by = ? AND rc.status = 'active'
+`, [admin_id]);
+
+const currentTenantCount = currentTenantCountResult.active_tenants_count;
+
+// ثالثًا التحقق إذا تم تجاوز الحد الأقصى
+if (currentTenantCount >= tenant_limit) {
+  return res.status(400).json({
+    message: `❌ لقد وصلت للحد الأقصى المسموح (${tenant_limit}) من المستأجرين.`,
+    tenant_limit,
+    currentTenantCount
+  });
+}
+
   let createdTenant = false;
   let createdToken = false;
   let tenantDbId, token;
@@ -4317,10 +6002,89 @@ app.post('/api/reviews/add', verifyToken, async (req, res) => {
 });
 
 
+app.post('/api/admin/reviews/add', verifyToken, async (req, res) => {
+  const { id: adminId, userType } = req.user;
+  const { rating, comment } = req.body;
+
+  // تحقق أن المستخدم مالك (admin)
+  if (userType !== 'admin') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط الملاك يمكنهم إضافة تقييم.' });
+  }
+
+  if (!rating || rating < 1 || rating > 5) {
+    return res.status(400).json({ message: 'يرجى إرسال تقييم بين 1 و5' });
+  }
+
+  const insertReviewSql = `
+    INSERT INTO admin_reviews (admin_id, rating, comment)
+    VALUES (?, ?, ?)
+  `;
+
+  const insertPointsSql = `
+    INSERT INTO admin_review_points (admin_id, points, source)
+    VALUES (?, ?, ?)
+  `;
+
+  try {
+    await query(insertReviewSql, [adminId, rating, comment || '']);
+    await query(insertPointsSql, [adminId, 10, 'إرسال تقييم']);
+
+    res.json({ message: '✅ تم تسجيل تقييمك وحصلت على 10 نقاط!' });
+
+  } catch (err) {
+    console.error('❌ Admin-Review-add Error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء إرسال التقييم' });
+  }
+});
+
+
+app.get('/api/admin/reviews', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه رؤية تقييمات الملاك.' });
+  }
+
+  const statsSql = `
+    SELECT 
+      COUNT(*) AS total_reviews,
+      AVG(rating) AS average_rating
+    FROM admin_reviews;
+  `;
+
+  const recentReviewsSql = `
+    SELECT ar.admin_id, u.name AS admin_name, ar.rating, ar.comment, ar.created_at
+    FROM admin_reviews ar
+    JOIN users u ON ar.admin_id = u.id
+    ORDER BY ar.created_at DESC
+    LIMIT 2;
+  `;
+
+  try {
+    const [stats] = await query(statsSql);
+    const recentReviews = await query(recentReviewsSql);
+
+    res.json({
+      total_reviews: stats.total_reviews,
+      average_rating: parseFloat(stats.average_rating).toFixed(2),
+      recent_reviews: recentReviews
+    });
+
+  } catch (err) {
+    console.error('❌ Super-Admin-Reviews-fetch Error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب تقييمات الملاك.' });
+  }
+});
+
+
+
+
+
 
 // ✅ API: جلب التقييمات (للموقع أو للمالك لو عنده صلاحية)
 app.get('/api/reviews-summary/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
+  const { userType } = req.user; // ⬅️ استخراج نوع المستخدم
 
   const permissionSql = `
     SELECT enabled FROM review_permissions WHERE admin_id = ?
@@ -4343,10 +6107,12 @@ app.get('/api/reviews-summary/:adminId', verifyToken, async (req, res) => {
   `;
 
   try {
-    const permissionResults = await query(permissionSql, [adminId]);
-
-    if (permissionResults.length === 0 || !permissionResults[0].enabled) {
-      return res.status(403).json({ message: '❌ لا يملك المالك صلاحية عرض التقييمات' });
+    // إذا كان سوبر، تخطي التحقق من الصلاحيات
+    if (userType !== 'super') {
+      const permissionResults = await query(permissionSql, [adminId]);
+      if (permissionResults.length === 0 || !permissionResults[0].enabled) {
+        return res.status(403).json({ message: '❌ لا يملك المالك صلاحية عرض التقييمات' });
+      }
     }
 
     const stats = await query(statsSql);
@@ -4363,6 +6129,7 @@ app.get('/api/reviews-summary/:adminId', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'فشل في جلب بيانات التقييمات' });
   }
 });
+
 
 // ✅ API: جلب تقييمات المستخدمين (للمستخدم نفسه)
 
@@ -4728,7 +6495,56 @@ app.put('/api/services/:id/order', verifyToken, async (req, res) => {
 });
 
 
+app.get('/api/super/finance-yearly', verifyToken, async (req, res) => {
+  const { userType, id: superId } = req.user;
 
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ فقط السوبر يمكنه الوصول لهذه البيانات.' });
+  }
+
+  try {
+    // جلب كل admin_id أنشأهم السوبر
+    const admins = await query(
+      `SELECT id FROM users WHERE user_type = 'admin' AND created_by = ?`,
+      [superId]
+    );
+    const adminIds = admins.map(a => a.id);
+
+    if (!adminIds.length) {
+      return res.json({ yearly: [] });
+    }
+
+    const sql = `
+      SELECT 
+        years.year AS year,
+        IFNULL(SUM(rcd.periodic_rent_payment) * 12, 0) AS yearly_expected_income,
+        COUNT(DISTINCT rcd.id) AS contracts_count
+      FROM (
+        SELECT YEAR(CURDATE()) AS year
+        UNION SELECT YEAR(CURDATE()) - 1
+        UNION SELECT YEAR(CURDATE()) - 2
+        UNION SELECT YEAR(CURDATE()) - 3
+        UNION SELECT YEAR(CURDATE()) - 4
+      ) AS years
+      JOIN rental_contracts_details rcd 
+        ON rcd.admin_id IN (${adminIds.map(() => '?').join(',')})
+        AND (
+          YEAR(rcd.contract_start) <= years.year 
+          AND YEAR(rcd.contract_end) >= years.year
+        )
+        AND rcd.contract_end > CURDATE()
+      GROUP BY years.year
+      ORDER BY years.year DESC
+    `;
+
+    const yearly = await query(sql, adminIds);
+    res.json({ yearly });
+
+  } catch (err) {
+    console.error('❌ Super-finance-yearly Error:', err);
+    res.status(500).json({ message: 'DB Error', error: err });
+  }
+});
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -6978,6 +8794,96 @@ ORDER BY ee.frequency;
     console.error('❌ Error fetching expense stats:', err);
     res.status(500).json({ message: 'خطأ في جلب إحصائيات المصروفات' });
   }
+});
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+app.post('/api/subscriptions/renew/google-play', verifyToken, async (req, res) => {
+  const { userId } = req.user;
+  const { subscription_type, purchaseToken } = req.body;
+
+  try {
+    // ✅ الخطوة المهمة هنا: احصل على الـ id الصحيح للمستخدم من جدول users
+    const [userRecord] = await query(`SELECT id, name, phone_number FROM users WHERE user_id = ?`, [userId]);
+
+    if (!userRecord) {
+      return res.status(404).json({ message: '❌ المستخدم غير موجود.' });
+    }
+
+    const realAdminId = userRecord.id;
+
+    const [currentSub] = await query(
+      `SELECT id, end_date FROM admin_subscriptions WHERE admin_id = ?`, 
+      [realAdminId]
+    );
+
+    let currentEndDate = currentSub?.end_date ? new Date(currentSub.end_date) : new Date();
+
+    if (currentEndDate < new Date()) {
+      currentEndDate = new Date();
+    }
+
+    let newEndDate;
+
+    if (subscription_type === 'monthly') {
+      newEndDate = new Date(currentEndDate);
+      newEndDate.setMonth(newEndDate.getMonth() + 1);
+    } else if (subscription_type === 'yearly') {
+      newEndDate = new Date(currentEndDate);
+      newEndDate.setFullYear(newEndDate.getFullYear() + 1);
+    } else {
+      return res.status(400).json({ message: 'نوع الاشتراك غير صالح.' });
+    }
+
+    const formattedEndDate = newEndDate.toISOString().slice(0, 10);
+
+    if (currentSub) {
+      // تحديث الاشتراك الحالي
+      await query(`
+        UPDATE admin_subscriptions
+        SET start_date = CURDATE(), end_date = ?, status = 'active', subscription_type = ?
+        WHERE admin_id = ?
+      `, [formattedEndDate, subscription_type, realAdminId]);
+
+      // تحديث الوكلاء المرتبطين
+      await query(`
+        UPDATE admin_subscriptions
+        SET start_date = CURDATE(), end_date = ?, status = 'active', subscription_type = ?
+        WHERE linked_subscription_id = ?
+      `, [formattedEndDate, subscription_type, currentSub.id]);
+
+    } else {
+      // إنشاء اشتراك جديد
+      await query(`
+        INSERT INTO admin_subscriptions (admin_id, start_date, end_date, subscription_type, status)
+        VALUES (?, CURDATE(), ?, ?, 'active')
+      `, [realAdminId, formattedEndDate, subscription_type]);
+    }
+
+    // إرسال رسالة الواتساب
+    if (userRecord.phone_number) {
+      const formattedPhone = userRecord.phone_number.replace('+', '');
+      const whatsappMessage = `
+      أهلاً ${userRecord.name} 👋،
+
+      تم تجديد اشتراكك بنجاح 🎉
+
+      نوع الاشتراك الجديد: ${subscription_type === 'monthly' ? 'شهري' : 'سنوي'}
+      تاريخ الانتهاء الجديد: ${formattedEndDate}
+
+      شكرًا لتجديد اشتراكك 🌟
+      `.trim();
+
+      await sendWhatsAppMessage(formattedPhone, whatsappMessage);
+    }
+
+    res.json({
+      message: '✅ تم تجديد الاشتراك بنجاح عبر Google Play وإرسال الإشعار.',
+      newEndDate: formattedEndDate
+    });
+
+  } catch (error) {
+    console.error('❌ Error renewing subscription via Google Play:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء تجديد الاشتراك.' });
+  } 
 });
 
 
