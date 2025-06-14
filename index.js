@@ -575,7 +575,8 @@ app.get('/api/active-subscriptions', verifyToken, async (req, res) => {
       u.user_id,
       u.phone_number,
       s.start_date,
-      s.end_date
+      s.end_date,
+      s.tenant_limit
     FROM admin_subscriptions s
     JOIN users u ON s.admin_id = u.id
     WHERE s.status = 'active'
@@ -598,6 +599,7 @@ app.get('/api/active-subscriptions', verifyToken, async (req, res) => {
     res.status(500).json({ message: 'حدث خطأ أثناء جلب الاشتراكات الفعالة.' });
   }
 });
+
 
 
 
@@ -717,6 +719,82 @@ app.post('/api/subscriptions/:adminId/renew', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('❌ Error renewing subscription:', error);
     res.status(500).json({ message: 'حدث خطأ أثناء تجديد الاشتراك.' });
+  }
+});
+
+
+
+// 🔹 تحديث عدد المستأجرين المسموح لمالك منفرد (Admin)
+app.post('/api/subscriptions/:adminId/update-tenant-limit', verifyToken, async (req, res) => {
+  const { userType } = req.user;
+  const { adminId } = req.params;
+  const { tenant_limit } = req.body;
+
+  if (userType !== 'super') {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة: فقط السوبر يمكنه تحديث الحد.' });
+  }
+
+  if (typeof tenant_limit !== 'number' || tenant_limit < 0) {
+    return res.status(400).json({ message: '❌ عدد المستأجرين المسموح بهم غير صالح.' });
+  }
+
+  try {
+    const [userCheck] = await query(
+      `SELECT id FROM users WHERE id = ? AND user_type IN ('admin', 'viewer')`, 
+      [adminId]
+    );
+
+    if (!userCheck) {
+      return res.status(404).json({ message: '❌ لم يتم العثور على المستخدم.' });
+    }
+
+    // تحديث tenant_limit_per_agent في users
+    await query(`
+      UPDATE users SET tenant_limit_per_agent = ?
+      WHERE id = ?
+    `, [tenant_limit, adminId]);
+
+    // تحديث tenant_limit في admin_subscriptions
+    await query(`
+      UPDATE admin_subscriptions SET tenant_limit = ?
+      WHERE admin_id = ?
+    `, [tenant_limit, adminId]);
+
+    // تحديث اشتراكات الوكلاء المرتبطة (إذا وجد)
+    const [currentSub] = await query(`SELECT id FROM admin_subscriptions WHERE admin_id = ?`, [adminId]);
+    if (currentSub) {
+      await query(`
+        UPDATE admin_subscriptions SET tenant_limit = ?
+        WHERE linked_subscription_id = ?
+      `, [tenant_limit, currentSub.id]);
+    }
+
+    // بيانات المستخدم لإرسال الإشعار (اختياري)
+    const [adminData] = await query(`SELECT name, phone_number FROM users WHERE id = ?`, [adminId]);
+
+    if (adminData && adminData.phone_number) {
+      const formattedPhone = adminData.phone_number.replace('+', '');
+      const whatsappMessage = `
+      أهلاً ${adminData.name} 👋،
+
+      تم تحديث عدد المستأجرين المسموح بهم بنجاح 🎉
+
+      العدد الجديد المسموح به: ${tenant_limit}
+
+      شكرًا لاستخدام منصتنا 🌟
+      `.trim();
+
+      await sendWhatsAppMessage(formattedPhone, whatsappMessage);
+    }
+
+    res.json({
+      message: '✅ تم تحديث عدد المستأجرين المسموح بنجاح.',
+      tenant_limit
+    });
+
+  } catch (error) {
+    console.error('❌ Error updating tenant limit:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء تحديث عدد المستأجرين.' });
   }
 });
 
@@ -2732,8 +2810,16 @@ app.post('/api/viewers/:viewerId/update-agent-tenant-limit', verifyToken, async 
       console.log('👥 الوكلاء:', agents.map(a => ({ id: a.id, name: a.name })));
     }
 
+
+
     // التحديث الفعلي
-    const result = await query(`
+    const result =
+    await query(`
+  UPDATE users
+  SET tenant_limit_per_agent = ?
+  WHERE id = ? AND user_type = 'viewer'
+`, [tenant_limit, viewerId]);
+    await query(`
       UPDATE admin_subscriptions
       SET tenant_limit = ?
       WHERE admin_id IN (SELECT id FROM users WHERE viewer_id = ?)
@@ -3368,35 +3454,85 @@ if (currentTenantCount >= tenant_limit) {
 
     const user_id = data.tenant_id_number;
 
-    const today = new Date();
-    const contractEndDate = new Date(data.contract_end);
+const today = new Date();
+const contractEndDate = new Date(data.contract_end);
 
-    // 👇 شرط ذكي لإضافة المستخدم إذا العقد ما زال ساريًا
-    if (contractEndDate <= today) {
-      return res.status(400).json({
-        message: '❌ لا يمكن إنشاء مستخدم لأن العقد منتهي أو ينتهي اليوم.',
-        contract_end: data.contract_end
-      });
-    }
-    // 👇 شرط ذكي لإضافة المستخدم إذا العقد ما زال ساريًا
+// تحقق إذا كان العقد منتهي أو ينتهي اليوم
+if (contractEndDate <= today) {
+
+  // Property ID logic
+  let property_id;
+  const [existingProperty] = await query(`
+    SELECT property_id FROM properties
+    WHERE property_national_address = ? AND admin_id = ?
+    LIMIT 1
+  `, [data.property_national_address, admin_id]);
+
+  if (existingProperty) {
+    property_id = existingProperty.property_id;
+  } else {
+    const insertResult = await query(`
+      INSERT INTO properties (property_national_address, property_units_count, admin_id)
+      VALUES (?, ?, ?)
+    `, [data.property_national_address, data.property_units_count, admin_id]);
+    property_id = insertResult.insertId;
+  }
+
+  data.property_id = property_id;
+
+  // إدخال مباشر إلى جدول الأرشيف فقط (دون إدخال في rental_contracts_details)
+  const fields = Object.keys(data).join(', ');
+  const placeholders = Object.keys(data).map(() => '?').join(', ');
+  const values = Object.values(data);
+
+  const archiveQuery = `
+    INSERT INTO contracts_archive (${fields}, archived_at)
+    VALUES (${placeholders}, NOW())
+  `;
+
+  let archiveResult;
+  try {
+    archiveResult = await query(archiveQuery, values);
+  } catch (err) {
+    console.error('❌ DB Error (Archive Contract):', err);
+    return res.status(500).json({ message: 'فشل في حفظ بيانات العقد المنتهي في الأرشيف' });
+  }
+
+  const archivedContractId = archiveResult.insertId;
+
+  // تحديث الحالة في جدول rental_contracts
+  try {
+    await query(`
+      UPDATE rental_contracts
+      SET status = 'expired'
+      WHERE tenant_id = ? AND contract_end <= CURDATE()
+    `, [data.tenant_id]);
+  } catch (err) {
+    console.error('❌ DB Error (Update Contract Status):', err);
+    return res.status(500).json({ message: 'تم الأرشفة لكن فشل تحديث الحالة' });
+  }
+
+  return res.json({
+    message: '✅ تم إضافة العقد المنتهي وإرساله للأرشيف بنجاح.',
+    archived_contract_id: archivedContractId,
+    archived: true
+  });
+}
+
 
 
     if (!user_id) {
       return res.status(400).json({ message: '❌ تعذّر استخراج رقم الهوية من الملف.' });
     }
 
-    const userCheckSql = 'SELECT id FROM users WHERE user_id = ? LIMIT 1';
+    const userCheckSql = 'SELECT user_id FROM users WHERE user_id = ? LIMIT 1';
+
     const tenant_name_from_pdf = data.tenant_name || '---';
 
     try {
       const existing = await query(userCheckSql, [user_id]);
+      console.log('🔍 existing user check:', existing);  // 👈 هنا
 
-  
-
-// ✅ عرّف الدالة بشكل واضح أولًا في الأعلى
-
-
-// ✅ ثم بقية الكود بشكل واضح ومنظم
 if (existing.length === 0) {
   token = Math.floor(10000000 + Math.random() * 90000000).toString();
 
@@ -3410,17 +3546,22 @@ if (existing.length === 0) {
   }
 
   const insertUserSql = `
-    INSERT INTO users (user_id, name, user_type, token, phone_number, created_at, created_by)
-    VALUES (?, ?, 'user', ?, ?, NOW(), ?)
-  `;
+  INSERT INTO users (user_id, name, user_type, token, phone_number, created_at, created_by)
+  VALUES (?, ?, 'user', ?, ?, NOW(), ?)
+  ON DUPLICATE KEY UPDATE
+    name = VALUES(name),
+    phone_number = VALUES(phone_number),
+    token = VALUES(token);
+`;
 
-  const userResult = await query(insertUserSql, [
-    user_id,
-    tenant_name_from_pdf,
-    token,
-    formattedPhone,
-    admin_id
-  ]);
+const userResult = await query(insertUserSql, [
+  user_id,
+  tenant_name_from_pdf,
+  token,
+  formattedPhone,
+  admin_id
+]);
+  console.log('🟢 بعد إدخال المستخدم:', user_id);
 
   tenantDbId = userResult.insertId;
   createdTenant = true;
@@ -6995,18 +7136,31 @@ app.put('/api/payment-alert/:targetUserId', verifyToken, async (req, res) => {
 // جلب جميع المستأجرين للمالك الحالي
 app.get('/api/admin-tenants/:adminId', verifyToken, async (req, res) => {
   const { adminId } = req.params;
+  const { address, floor } = req.query;
 
-  const sql = `
+  let sql = `
     SELECT 
       tenant_id, tenant_name, contract_number, contract_start, contract_end, contract_type,
-      tenant_phone, tenant_email, tenant_address
+      tenant_phone, tenant_email, tenant_address, unit_number, unit_floor_number, property_national_address
     FROM rental_contracts_details
     WHERE admin_id = ?
-    ORDER BY created_at DESC
   `;
+  const params = [adminId];
+
+  if (address) {
+    sql += ' AND property_national_address = ?';
+    params.push(address);
+  }
+
+  if (floor) {
+    sql += ' AND unit_floor_number = ?';
+    params.push(floor);
+  }
+
+  sql += ' ORDER BY created_at DESC';
 
   try {
-    const tenants = await query(sql, [adminId]);
+    const tenants = await query(sql, params);
     res.json({ tenants });
 
   } catch (err) {
@@ -7016,27 +7170,7 @@ app.get('/api/admin-tenants/:adminId', verifyToken, async (req, res) => {
 });
 
 
-app.get('/api/admin-tenants/:adminId', verifyToken, async (req, res) => {
-  const { adminId } = req.params;
 
-  const sql = `
-    SELECT 
-      tenant_id, tenant_name, contract_number, contract_start, contract_end, contract_type,
-      tenant_phone, tenant_email, tenant_address
-    FROM rental_contracts_details
-    WHERE admin_id = ?
-    ORDER BY created_at DESC
-  `;
-
-  try {
-    const tenants = await query(sql, [adminId]);
-    res.json({ tenants });
-
-  } catch (err) {
-    console.error('❌ Admin-tenants-fetch Error:', err);
-    res.status(500).json({ message: 'DB Error', error: err });
-  }
-});
 
 
 
@@ -8884,6 +9018,729 @@ app.post('/api/subscriptions/renew/google-play', verifyToken, async (req, res) =
     console.error('❌ Error renewing subscription via Google Play:', error);
     res.status(500).json({ message: 'حدث خطأ أثناء تجديد الاشتراك.' });
   } 
+});
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 🔹 إجمالي عدد المستأجرين للوكلاء المرتبطين بViewer معين
+app.get('/api/viewers/:viewerId/total-tenants', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 التحقق من صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT COUNT(rc.id) AS total_tenants_count
+    FROM rental_contracts rc
+    JOIN users tenants ON rc.tenant_id = tenants.id
+    JOIN users agents ON tenants.created_by = agents.id
+    WHERE agents.viewer_id = ?
+  `;
+
+  try {
+    const [result] = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      totalTenantsCount: result.total_tenants_count || 0
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ في جلب عدد المستأجرين.', error });
+  }
+});
+
+
+// 🔹 بيانات المستأجرين بشكل مختصر (تابعين لوكلاء Viewer محدد)
+app.get('/api/viewers/:viewerId/tenants-summary', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 التحقق من صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT 
+      tenants.name AS tenantName,
+      rc.property_name AS propertyName,
+      rc.status AS contractStatus,
+      agents.name AS agentName
+    FROM rental_contracts rc
+    JOIN users tenants ON rc.tenant_id = tenants.id
+    JOIN users agents ON tenants.created_by = agents.id
+    WHERE agents.viewer_id = ?
+    ORDER BY rc.created_at DESC
+  `;
+
+  try {
+    const tenants = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      totalTenants: tenants.length,
+      tenants
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ في جلب بيانات المستأجرين.', error });
+  }
+});
+
+
+// 🔹 إجمالي عدد العقارات لوكلاء Viewer معين
+app.get('/api/viewers/:viewerId/total-properties', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 التحقق من صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT COUNT(DISTINCT rc.property_name) AS total_properties_count
+    FROM rental_contracts rc
+    JOIN users tenants ON rc.tenant_id = tenants.id
+    JOIN users agents ON tenants.created_by = agents.id
+    WHERE agents.viewer_id = ?
+  `;
+
+  try {
+    const [result] = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      totalPropertiesCount: result.total_properties_count || 0
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ في جلب عدد العقارات.', error });
+  }
+});
+
+
+// 🔹 إحصائية العقود الفعالة والمنتهية لوكلاء Viewer معين
+app.get('/api/viewers/:viewerId/contracts-stats', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 التحقق من صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT
+      SUM(CASE WHEN rc.status = 'active' THEN 1 ELSE 0 END) AS active_contracts_count,
+      SUM(CASE WHEN rc.status IN ('expired', 'terminated') THEN 1 ELSE 0 END) AS expired_contracts_count
+    FROM rental_contracts rc
+    JOIN users tenants ON rc.tenant_id = tenants.id
+    JOIN users agents ON tenants.created_by = agents.id
+    WHERE agents.viewer_id = ?
+  `;
+
+  try {
+    const [result] = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      activeContractsCount: result.active_contracts_count || 0,
+      expiredContractsCount: result.expired_contracts_count || 0,
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب إحصائية العقود.', error });
+  }
+});
+
+
+// 🔹 إجمالي عدد الوكلاء المرتبطين ب Viewer معين
+app.get('/api/viewers/:viewerId/agents-count', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 التحقق من صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT COUNT(*) AS total_agents
+    FROM users
+    WHERE viewer_id = ? AND user_type = 'admin'
+  `;
+
+  try {
+    const [result] = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      totalAgentsCount: result.total_agents || 0
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب عدد الوكلاء.', error });
+  }
+});
+
+// 🔹 جلب نوع اشتراك Viewer معين (شهري أو سنوي) وحالة الاشتراك
+app.get('/api/viewers/:viewerId/subscription-type', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 التحقق من صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT subscription_type, status, start_date, end_date
+    FROM admin_subscriptions
+    WHERE admin_id = ?
+    ORDER BY end_date DESC
+    LIMIT 1
+  `;
+
+  try {
+    const [subscription] = await query(sql, [viewerId]);
+
+    if (!subscription) {
+      return res.status(404).json({ message: '⚠️ لا يوجد اشتراك لهذا المتطلع.' });
+    }
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      subscriptionType: subscription.subscription_type,
+      subscriptionStatus: subscription.status,
+      startDate: subscription.start_date,
+      endDate: subscription.end_date
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب بيانات الاشتراك.', error });
+  }
+});
+
+// 🔹 تفاصيل الوكلاء الكاملة لـ Viewer معين
+app.get('/api/viewers/:viewerId/agents-details', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 التحقق من صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT 
+      u.id AS agentId,
+      u.user_id AS agentUserId,
+      u.name AS agentName,
+      u.phone_number AS phoneNumber,
+      s.subscription_type AS subscriptionType,
+      s.status AS subscriptionStatus,
+      s.start_date AS subscriptionStart,
+      s.end_date AS subscriptionEnd,
+      s.tenant_limit AS tenantLimit,
+      (
+        SELECT COUNT(*)
+        FROM rental_contracts rc
+        JOIN users tenants ON tenants.id = rc.tenant_id
+        WHERE tenants.created_by = u.id AND rc.status = 'active'
+      ) AS activeTenantsCount
+    FROM users u
+    LEFT JOIN admin_subscriptions s ON u.id = s.admin_id
+    WHERE u.viewer_id = ? AND u.user_type = 'admin'
+  `;
+
+  try {
+    const agents = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      totalAgents: agents.length,
+      agents
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب تفاصيل الوكلاء.', error });
+  }
+});
+
+// 🔹 تفاصيل العقود الفعالة لوكلاء Viewer معين
+app.get('/api/viewers/:viewerId/active-contracts-details', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 التحقق من صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT
+      rc.id AS contractId,
+      rc.property_name AS propertyName,
+      rc.contract_start AS contractStart,
+      rc.contract_end AS contractEnd,
+      tenants.name AS tenantName,
+      tenants.phone_number AS tenantPhone,
+      agents.name AS agentName,
+      agents.phone_number AS agentPhone
+    FROM rental_contracts rc
+    JOIN users tenants ON rc.tenant_id = tenants.id
+    JOIN users agents ON tenants.created_by = agents.id
+    WHERE agents.viewer_id = ? AND rc.status = 'active'
+    ORDER BY rc.contract_end ASC
+  `;
+
+  try {
+    const contracts = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      totalActiveContracts: contracts.length,
+      contracts
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب تفاصيل العقود الفعالة.', error });
+  }
+});
+
+
+// 🔹 تفاصيل العقود المنتهية لوكلاء Viewer معين
+app.get('/api/viewers/:viewerId/expired-contracts-details', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 التحقق من صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT
+      rc.id AS contractId,
+      rc.property_name AS propertyName,
+      rc.contract_start AS contractStart,
+      rc.contract_end AS contractEnd,
+      rc.status AS contractStatus,
+      tenants.name AS tenantName,
+      tenants.phone_number AS tenantPhone,
+      agents.name AS agentName,
+      agents.phone_number AS agentPhone
+    FROM rental_contracts rc
+    JOIN users tenants ON rc.tenant_id = tenants.id
+    JOIN users agents ON tenants.created_by = agents.id
+    WHERE agents.viewer_id = ? AND rc.status IN ('expired', 'terminated')
+    ORDER BY rc.contract_end DESC
+  `;
+
+  try {
+    const contracts = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      totalExpiredContracts: contracts.length,
+      contracts
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب تفاصيل العقود المنتهية.', error });
+  }
+});
+
+
+// 🔹 تفاصيل اشتراك الـ Viewer بشكل كامل
+app.get('/api/viewers/:viewerId/subscription-details', verifyToken, async (req, res) => {
+  const { userType, id: userId } = req.user;
+  const { viewerId } = req.params;
+
+  // 🔐 صلاحية الوصول
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT 
+      s.subscription_type AS subscriptionType,
+      s.status AS subscriptionStatus,
+      s.start_date AS subscriptionStart,
+      s.end_date AS subscriptionEnd,
+      u.max_agents AS maxAgents,
+      u.tenant_limit_per_agent AS tenantLimitPerAgent
+    FROM admin_subscriptions s
+    JOIN users u ON u.id = s.admin_id
+    WHERE s.admin_id = ?
+    ORDER BY s.end_date DESC
+    LIMIT 1
+  `;
+
+  try {
+    const [subscription] = await query(sql, [viewerId]);
+
+    if (!subscription) {
+      return res.status(404).json({ message: '⚠️ لا يوجد اشتراك لهذا المتطلع.' });
+    }
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      subscription
+    });
+
+  } catch (error) {
+    console.error('❌ DB Error:', error);
+    res.status(500).json({ message: 'حدث خطأ في جلب تفاصيل الاشتراك.', error });
+  }
+});
+
+// 🔹 API لعرض الدخل الشهري الإجمالي والمختصر للفيور من جميع وكلائه
+app.get('/api/viewer-monthly-income/:viewerId', verifyToken, async (req, res) => {
+  const { viewerId } = req.params;
+  const { userType, id: userId } = req.user;
+
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT 
+      IFNULL(SUM(rcd.periodic_rent_payment), 0) AS total_monthly_income,
+      COUNT(rcd.id) AS active_contracts_count
+    FROM rental_contracts_details rcd
+    JOIN rental_contracts rc ON rc.tenant_id = rcd.tenant_id
+    WHERE rc.status = 'active'
+      AND rcd.admin_id IN (SELECT id FROM users WHERE viewer_id = ?)
+      AND CURDATE() BETWEEN rc.contract_start AND rc.contract_end
+  `;
+
+  try {
+    const [result] = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      monthlyIncome: parseFloat(result.total_monthly_income).toFixed(2),
+      activeContractsCount: result.active_contracts_count
+    });
+
+  } catch (err) {
+    console.error('❌ Viewer-monthly-income Error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب الدخل الشهري.', error: err });
+  }
+});
+
+
+app.get('/api/viewer-annual-income/:viewerId', verifyToken, async (req, res) => {
+  const { viewerId } = req.params;
+  const { userType, id: userId } = req.user;
+
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT 
+      IFNULL(SUM(rcd.periodic_rent_payment * 12), 0) AS total_annual_income,
+      COUNT(rcd.id) AS active_contracts_count
+    FROM rental_contracts_details rcd
+    JOIN rental_contracts rc ON rc.tenant_id = rcd.tenant_id
+    WHERE rc.status = 'active'
+      AND rcd.admin_id IN (SELECT id FROM users WHERE viewer_id = ?)
+      AND CURDATE() BETWEEN rc.contract_start AND rc.contract_end
+  `;
+
+  try {
+    const [result] = await query(sql, [viewerId]);
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      annualIncome: parseFloat(result.total_annual_income).toFixed(2),
+      activeContractsCount: result.active_contracts_count
+    });
+
+  } catch (err) {
+    console.error('❌ Viewer-annual-income Error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب الدخل السنوي.', error: err });
+  }
+});
+
+
+
+app.get('/api/viewer/expenses-summary/:viewerId', verifyToken, async (req, res) => {
+  const { viewerId } = req.params;
+  const { userType, id: userId } = req.user;
+
+  if (userType !== 'super' && (userType !== 'viewer' || parseInt(viewerId) !== userId)) {
+    return res.status(403).json({ message: '❌ صلاحية مفقودة.' });
+  }
+
+  const sql = `
+    SELECT ee.frequency, IFNULL(SUM(ee.amount), 0) AS total_amount FROM expenses_entries ee
+    INNER JOIN (
+      SELECT user_id, type_id, MAX(id) AS max_id
+      FROM expenses_entries
+      GROUP BY user_id, type_id
+    ) last_entries ON ee.id = last_entries.max_id
+    INNER JOIN users u ON ee.user_id = u.id
+    WHERE u.viewer_id = ?
+    GROUP BY ee.frequency
+  `;
+
+  try {
+    const expensesResults = await query(sql, [viewerId]);
+
+    const summary = { daily: 0, monthly: 0, yearly: 0 };
+
+    expensesResults.forEach(row => {
+      summary[row.frequency] = parseFloat(row.total_amount);
+    });
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      expensesSummary: {
+        daily: summary.daily.toFixed(2),
+        monthly: summary.monthly.toFixed(2),
+        yearly: summary.yearly.toFixed(2)
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ Error fetching viewer expenses summary:', err);
+    res.status(500).json({ message: 'خطأ في جلب إجمالي المصروفات' });
+  }
+});
+
+
+
+app.post('/api/viewer/:viewerId/agents-salaries', verifyToken, async (req, res) => {
+  const { viewerId } = req.params;
+  const { salaries } = req.body; // [{agent_id, salary}, ...]
+
+  if (!Array.isArray(salaries)) {
+    return res.status(400).json({ message: 'بيانات الرواتب غير صحيحة.' });
+  }
+
+  try {
+    for (const { agent_id, salary } of salaries) {
+      await query(`
+        INSERT INTO viewer_agents_salaries (viewer_id, agent_id, salary)
+        VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE salary = ?
+      `, [viewerId, agent_id, salary, salary]);
+    }
+
+    res.json({ message: 'تم تحديث رواتب الوكلاء بنجاح.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'خطأ في تحديث الرواتب.' });
+  }
+});
+
+
+
+app.get('/api/viewer/:viewerId/annual-financial-summary', verifyToken, async (req, res) => {
+  const { viewerId } = req.params;
+
+  try {
+    // إجمالي دخل العقود السنوي
+    const [incomeResult] = await query(`
+      SELECT IFNULL(SUM(rcd.periodic_rent_payment * rent_payments_count), 0) AS annual_income
+      FROM rental_contracts_details rcd
+      WHERE rcd.admin_id IN (SELECT id FROM users WHERE viewer_id = ?) 
+        AND rcd.contract_end > CURDATE()
+    `, [viewerId]);
+
+    // إجمالي المصروفات (اليومي، الشهري، السنوي)
+const expensesResults = await query(`
+  SELECT ee.frequency, IFNULL(SUM(ee.amount), 0) AS total_amount
+  FROM expenses_entries ee
+  INNER JOIN (
+    SELECT user_id, type_id, MAX(id) AS max_id
+    FROM expenses_entries
+    GROUP BY user_id, type_id
+  ) last_entries ON ee.id = last_entries.max_id
+  INNER JOIN users u ON ee.user_id = u.id
+  INNER JOIN user_expenses_types uet ON ee.type_id = uet.type_id AND ee.user_id = uet.user_id
+  WHERE u.viewer_id = ?
+  GROUP BY ee.frequency
+`, [viewerId]);
+
+    let daily = 0, monthly = 0, yearly = 0;
+    expensesResults.forEach(row => {
+      if (row.frequency === 'daily') daily = parseFloat(row.total_amount);
+      if (row.frequency === 'monthly') monthly = parseFloat(row.total_amount);
+      if (row.frequency === 'yearly') yearly = parseFloat(row.total_amount);
+    });
+
+    const totalExpenses = (daily * 30 * 12) + (monthly * 12) + yearly;
+
+    // إجمالي رواتب الوكلاء
+    const [salariesResult] = await query(`
+      SELECT IFNULL(SUM(salary), 0) AS total_salaries
+      FROM viewer_agents_salaries
+      WHERE viewer_id = ?
+    `, [viewerId]);
+
+    const annualIncome = parseFloat(incomeResult.annual_income);
+    const totalSalaries = parseFloat(salariesResult.total_salaries);
+    const netProfit = annualIncome - totalExpenses - totalSalaries;
+
+    res.json({
+      viewerId: parseInt(viewerId),
+      financialSummary: {
+        annualIncome: annualIncome.toFixed(2),
+        totalExpenses: totalExpenses.toFixed(2),
+        totalAgentsSalaries: totalSalaries.toFixed(2),
+        netProfit: netProfit.toFixed(2)
+      }
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'خطأ في استعلام الملخص المالي.' });
+  }
+});
+
+
+
+app.get('/api/viewer/:viewerId/name', verifyToken, async (req, res) => {
+  const { viewerId } = req.params;
+
+  try {
+    const [viewer] = await query(`SELECT name FROM users WHERE id = ? AND user_type = 'viewer'`, [viewerId]);
+
+    if (!viewer) {
+      return res.status(404).json({ message: 'لم يتم العثور على الفيور.' });
+    }
+
+    res.json({ 
+      viewerId: parseInt(viewerId), 
+      viewerName: viewer.name 
+    });
+
+  } catch (err) {
+    console.error('❌ Error fetching viewer name:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء جلب اسم الفيور.' });
+  }
+});
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// ✅ API: جلب المستأجرين مجمّعين حسب عنوان العقار ثم رقم الدور
+// ✅ API: جلب المستأجرين مجمّعين حسب عنوان العقار ثم رقم الدور (حسب adminId في الباراميتر)
+// ✅ API: إحصائيات المستأجرين حسب العنوان والدور
+// ✅ API: إحصائيات المستأجرين حسب العنوان والدور + أرقام الوحدات
+app.get('/api/admin/tenant-stats/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  try {
+    const rows = await query(`
+      SELECT 
+        p.property_national_address,
+        d.unit_floor_number,
+        d.unit_number,
+        rc.status
+      FROM rental_contracts_details d
+      JOIN properties p ON d.property_id = p.property_id
+      JOIN rental_contracts rc ON rc.tenant_id = d.tenant_id
+      WHERE d.admin_id = ?
+      ORDER BY p.property_national_address, d.unit_floor_number, d.unit_number
+    `, [adminId]);
+
+    // تشكيل الإحصائيات مجمعة
+    const stats = {};
+
+    rows.forEach(row => {
+      const address = row.property_national_address;
+      const floor = row.unit_floor_number || 'دور غير معروف';
+
+      if (!stats[address]) stats[address] = {};
+      if (!stats[address][floor]) {
+        stats[address][floor] = {
+          tenant_count: 0,
+          active_contracts: 0,
+          expired_contracts: 0,
+          unit_numbers: []
+        };
+      }
+
+      stats[address][floor].tenant_count++;
+      if (row.status === 'active') stats[address][floor].active_contracts++;
+      if (row.status === 'expired') stats[address][floor].expired_contracts++;
+
+      stats[address][floor].unit_numbers.push(row.unit_number);
+    });
+
+    res.json({ tenant_stats: stats });
+  } catch (err) {
+    console.error('❌ Error fetching tenant stats:', err);
+    res.status(500).json({ message: 'خطأ في جلب إحصائيات المستأجرين' });
+  }
+});
+
+
+
+
+
+app.post('/api/admin/save-address-label', verifyToken, async (req, res) => {
+  const { id: adminId } = req.user;
+  const { address, customLabel } = req.body;
+
+  if (!address || !customLabel) {
+    return res.status(400).json({ message: '❗ العنوان والتسمية مطلوبة.' });
+  }
+
+  try {
+    await query(`
+      INSERT INTO custom_address_labels (admin_id, original_address, custom_label)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE custom_label = VALUES(custom_label)
+    `, [adminId, address, customLabel]);
+
+    res.json({ message: '✅ تم حفظ التسمية المخصصة بنجاح.' });
+  } catch (err) {
+    console.error('❌ Save Address Label Error:', err);
+    res.status(500).json({ message: 'حدث خطأ أثناء حفظ التسمية.' });
+  }
+});
+
+// ✅ 3. API لجلب جميع التسميات المخصصة للمالك أو الوكيل فقط
+app.get('/api/admin/address-labels/:adminId', verifyToken, async (req, res) => {
+  const { adminId } = req.params;
+
+  try {
+    const labels = await query(`
+      SELECT original_address, custom_label
+      FROM custom_address_labels
+      WHERE admin_id = ?
+    `, [adminId]);
+
+    const labelMap = {};
+    labels.forEach(row => {
+      labelMap[row.original_address] = row.custom_label;
+    });
+
+    res.json({ labels: labelMap });
+  } catch (err) {
+    console.error('❌ Fetch Address Labels Error:', err);
+    res.status(500).json({ message: 'فشل في جلب التسميات.' });
+  }
 });
 
 
