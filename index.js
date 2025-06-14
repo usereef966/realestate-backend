@@ -3452,13 +3452,17 @@ if (currentTenantCount >= tenant_limit) {
       admin_id: admin_id
     };
 
-    const user_id = data.tenant_id_number;
+const user_id = data.tenant_id_number;
 
 const today = new Date();
 const contractEndDate = new Date(data.contract_end);
 
 // تحقق إذا كان العقد منتهي أو ينتهي اليوم
 if (contractEndDate <= today) {
+
+    if (!data.contract_id) {
+    delete data.contract_id;
+  }
 
   // Property ID logic
   let property_id;
