@@ -27,4 +27,10 @@ setInterval(async () => {
   }
 }, 60000);
 
+// تعديل SQL Mode لمطابقة القاعدة المحلية
+query("SET SESSION sql_mode = REPLACE(@@sql_mode, 'STRICT_TRANS_TABLES', '')")
+  .then(() => console.log('⚙️ SQL mode adjusted: STRICT_TRANS_TABLES removed'))
+  .catch((err) => console.error('❌ Failed to adjust SQL mode:', err));
+
+
 module.exports = { query };
